@@ -107,7 +107,10 @@ Interactive API docs (FastAPI/Swagger): http://localhost:8000/docs
 ## Client script (`./transcribe`)
 
 Wraps the whole flow — file selection, upload, background polling (immune to
-proxy timeouts), printing, and saving:
+proxy timeouts), printing, and saving. **Zero dependencies** (Python standard
+library only, any Python 3.8+): copy this one file to any machine and run it,
+no venv or `pip install` needed. A GUI file picker (zenity) is used when no
+path is given and available, otherwise a terminal prompt.
 
 ```bash
 ./transcribe sermon.mp3                  # GUI file picker if no path given (zenity)
