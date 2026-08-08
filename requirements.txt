@@ -1,0 +1,10 @@
+torch
+transformers>=5.4.0
+accelerate
+sentencepiece
+protobuf
+fastapi
+uvicorn[standard]
+python-multipart
+soundfile
+librosa

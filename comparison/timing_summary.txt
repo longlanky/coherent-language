@@ -1,0 +1,20 @@
+=== opening_88s (audio 88.82s) ===
+  GPU chunked : wall    38.4s  (load 5.4s + inference 32.1s)
+  CPU single  : wall    46.4s  (load 8.3s + inference 37.4s)
+  inference speedup GPU vs CPU: 1.16x
+  word similarity: 1.0000 (258 vs 258 words)
+=== second_khutba_103s (audio 103.82s) ===
+  GPU chunked : wall    38.4s  (load 5.3s + inference 31.3s)
+  CPU single  : wall    44.4s  (load 6.0s + inference 37.3s)
+  inference speedup GPU vs CPU: 1.19x
+  word similarity: 1.0000 (166 vs 166 words)
+=== convo_159s (audio 159.24s) ===
+  GPU chunked : wall    48.4s  (load 5.2s + inference 41.8s)
+  CPU single  : wall    52.5s  (load 5.6s + inference 44.7s)
+  inference speedup GPU vs CPU: 1.07x
+  word similarity: 0.9968 (311 vs 311 words)
+=== first_khutba_1465s (audio 1464.98s) ===
+  GPU chunked : wall   320.9s  (load 5.5s + inference 313.6s)
+  CPU single  : wall   311.4s  (load 6.5s + inference 302.9s)
+  inference speedup GPU vs CPU: 0.97x
+  word similarity: 1.0000 (2864 vs 2864 words)

@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""transcribe — portable CLI client for the Cohere Transcribe ASR API.
+
+Zero dependencies: standard library only, works with any Python 3.8+.
+Copy this single file anywhere and run it.
+
+Handles the full upload flow: file selection (GUI picker when available),
+upload, background-job polling (never hits proxy timeouts, e.g. Cloudflare's
+100 s), prints the transcript and saves it next to the audio file.
+
+Usage:
+  ./transcribe audio.mp3                      # upload with server defaults
+  ./transcribe                                # GUI file picker (zenity) or prompt
+  ./transcribe audio.mp3 --language ar --model cohere-transcribe-arabic-07-2026-int8enc
+  ./transcribe audio.mp3 --server http://127.0.0.1:8000 --output out.txt
+
+Auth (only needed for the Cloudflare-Access-protected public endpoint):
+  --cookie JWT | env CF_AUTHORIZATION | file ./cf.jwt  (first found wins)
+
+Env vars: ASR_SERVER (default https://asr.ninefive.cc), ASR_MODEL, ASR_LANGUAGE.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+from pathlib import Path
+
+POLL_EVERY = 5
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def pick_file() -> Path:
+    """GUI file picker via zenity, falling back to a terminal prompt."""
+    try:
+        out = subprocess.run(
+            ["zenity", "--file-selection", "--title=Select audio to transcribe"],
+            capture_output=True, text=True, timeout=300,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return Path(out.stdout.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return Path(input("Audio file path: ").strip())
+
+
+def get_cookie(args) -> str | None:
+    if args.cookie:
+        return args.cookie
+    if os.environ.get("CF_AUTHORIZATION"):
+        return os.environ["CF_AUTHORIZATION"]
+    jwt_file = SCRIPT_DIR / "cf.jwt"
+    if jwt_file.exists():
+        return jwt_file.read_text().strip()
+    return None
+
+
+def http_json(req: urllib.request.Request) -> dict:
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        body = exc.read()[:300].decode("utf-8", "replace")
+        sys.exit(f"HTTP {exc.code} from {req.full_url}: {body}")
+    except urllib.error.URLError as exc:
+        sys.exit(f"Cannot reach {req.full_url}: {exc.reason}")
+
+
+def submit(server: str, audio: Path, fields: dict, headers: dict) -> dict:
+    """multipart/form-data POST built by hand (no external libs)."""
+    boundary = uuid.uuid4().hex
+    body = b""
+    for key, value in fields.items():
+        body += (f"--{boundary}\r\nContent-Disposition: form-data; "
+                 f'name="{key}"\r\n\r\n{value}\r\n').encode()
+    body += (f"--{boundary}\r\nContent-Disposition: form-data; "
+             f'name="file"; filename="{audio.name}"\r\n'
+             f"Content-Type: application/octet-stream\r\n\r\n").encode()
+    body += audio.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
+
+    req = urllib.request.Request(
+        f"{server}/v1/audio/transcriptions", data=body, method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}", **headers},
+    )
+    return http_json(req)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description="Upload audio to the ASR server and save the transcript.")
+    p.add_argument("audio", nargs="?", help="Audio file (omit for a GUI file picker)")
+    p.add_argument("--server", default=os.environ.get("ASR_SERVER", "https://asr.ninefive.cc"))
+    p.add_argument("--model", default=os.environ.get("ASR_MODEL"), help="Model id (default: server's)")
+    p.add_argument("--language", default=os.environ.get("ASR_LANGUAGE"), help="e.g. ar, en")
+    p.add_argument("--no-punctuation", action="store_true")
+    p.add_argument("--cookie", help="Cloudflare Access JWT (CF_Authorization)")
+    p.add_argument("--output", help="Transcript output path (default: <audio>.<model>.txt)")
+    args = p.parse_args()
+
+    audio = Path(args.audio).expanduser() if args.audio else pick_file()
+    if not audio.is_file():
+        sys.exit(f"File not found: {audio}")
+
+    is_local = any(h in args.server for h in ("localhost", "127.0.0.1", "[::1]"))
+    headers = {}
+    cookie = get_cookie(args)
+    if cookie and not is_local:
+        headers["Cookie"] = f"CF_Authorization={cookie}"
+    elif not cookie and not is_local:
+        print("note: no Cloudflare cookie found (--cookie / CF_AUTHORIZATION / ./cf.jwt); "
+              "the public endpoint may redirect to a login page.", file=sys.stderr)
+
+    fields = {"background": "true", "punctuation": str(not args.no_punctuation).lower()}
+    if args.model:
+        fields["model"] = args.model
+    if args.language:
+        fields["language"] = args.language
+
+    print(f"Uploading {audio.name} ({audio.stat().st_size / 2**20:.1f} MiB) to {args.server} ...")
+    t0 = time.time()
+    job = submit(args.server, audio, fields, headers)
+    if "job_id" not in job:
+        sys.exit(f"Submit failed: {str(job)[:300]}")
+    job_id, model = job["job_id"], job.get("model", "?")
+    print(f"Job {job_id} queued (model: {model}). Waiting", end="", flush=True)
+
+    while True:
+        time.sleep(POLL_EVERY)
+        print(".", end="", flush=True)
+        req = urllib.request.Request(
+            f"{args.server}/v1/audio/transcriptions/jobs/{job_id}", headers=headers)
+        job = http_json(req)
+        status = job.get("status")
+        if status in ("done", "failed"):
+            break
+    elapsed = time.time() - t0
+    print()
+
+    if status == "failed":
+        sys.exit(f"Transcription failed: {job.get('error')}")
+
+    result = job["result"]
+    text = result["text"]
+    used_model = result.get("model", model)
+    out = Path(args.output) if args.output else audio.with_suffix(f".{used_model}.txt")
+    out.write_text(text + "\n")
+
+    print(f"\n--- transcript ({result.get('duration_s')}s audio, {elapsed:.0f}s total) ---\n")
+    print(text)
+    print(f"\n--- saved to {out} ---")
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit("\nAborted (the server-side job keeps running; re-poll its job id if needed).")

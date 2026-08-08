@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# asr-server — userland daemon manager for the Cohere Transcribe ASR API.
+#
+# Usage:
+#   ./asr-server start [options]   # start daemonized (nohup + pidfile)
+#   ./asr-server stop [--port N]   # terminate the daemon (default port 8000)
+#   ./asr-server restart [options] # stop then start
+#   ./asr-server status            # all running instances + GPU memory
+#   ./asr-server logs [--port N]   # follow the server log
+#
+# Options for start/restart:
+#   --device cuda|cpu        Inference device (default: cuda if available)
+#   --gpu N                  GPU index to use (CUDA_VISIBLE_DEVICES; default: all visible)
+#   --dtype float16|bfloat16|float32
+#                            Model dtype (default: float16 on GPU, float32 on CPU)
+#   --default-model ID       Model used when requests omit `model`
+#                            (e.g. cohere-transcribe-03-2026-int8enc to make
+#                            INT8-encoder quantization the default)
+#   --chunk-batch N          Long-audio chunks generated per mini-batch
+#                            (default: 4; use a huge number to disable mini-batching)
+#   --host ADDR              Bind address (default: 0.0.0.0)
+#   --port N                 Bind port (default: 8000); pid/log files are
+#                            per-port, so multiple instances can coexist
+#
+# Examples:
+#   ./asr-server start --device cuda --gpu 0 --default-model cohere-transcribe-03-2026-int8enc
+#   ./asr-server start --device cpu --dtype float32 --port 8002
+
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UVICORN="$DIR/.venv/bin/uvicorn"
+
+# Port is needed before anything else (pid/log files are per-port).
+PORT=8000
+prev=""
+for a in "$@"; do
+    [[ "$prev" == "--port" ]] && PORT="$a"
+    prev="$a"
+done
+PIDFILE="$DIR/asr-server.$PORT.pid"
+LOGFILE="$DIR/asr-server.$PORT.log"
+
+is_running() {
+    [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+cmd_start() {
+    local host=0.0.0.0 device="" dtype="" gpu="" default_model="" chunk_batch=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --device) device="$2"; shift 2 ;;
+            --dtype) dtype="$2"; shift 2 ;;
+            --gpu) gpu="$2"; shift 2 ;;
+            --default-model) default_model="$2"; shift 2 ;;
+            --chunk-batch) chunk_batch="$2"; shift 2 ;;
+            --host) host="$2"; shift 2 ;;
+            --port) shift 2 ;;  # already consumed
+            *) echo "Unknown option: $1" >&2; exit 2 ;;
+        esac
+    done
+
+    if is_running; then
+        echo "Already running on port $PORT (pid $(cat "$PIDFILE")). Use 'restart' to change settings."
+        exit 1
+    fi
+
+    local envs=()
+    [[ -n "$device" ]] && envs+=("ASR_DEVICE=$device")
+    [[ -n "$dtype" ]] && envs+=("ASR_DTYPE=$dtype")
+    [[ -n "$gpu" ]] && envs+=("CUDA_VISIBLE_DEVICES=$gpu")
+    [[ -n "$default_model" ]] && envs+=("ASR_DEFAULT_MODEL=$default_model")
+    [[ -n "$chunk_batch" ]] && envs+=("ASR_CHUNK_BATCH=$chunk_batch")
+
+    echo "Starting ASR server on $host:$PORT ${envs:+with ${envs[*]}}"
+    cd "$DIR"
+    nohup env "${envs[@]}" "$UVICORN" app:app --host "$host" --port "$PORT" \
+        >>"$LOGFILE" 2>&1 &
+    echo $! >"$PIDFILE"
+
+    for _ in $(seq 1 30); do
+        if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+            echo "Up (pid $(cat "$PIDFILE")). Log: $LOGFILE"
+            return
+        fi
+        is_running || { echo "Server died at startup; last log lines:"; tail -5 "$LOGFILE"; exit 1; }
+        sleep 1
+    done
+    echo "Started but /health not answering yet; check: $0 logs --port $PORT"
+}
+
+cmd_stop() {
+    if ! is_running; then
+        echo "Not running on port $PORT."
+        rm -f "$PIDFILE"
+        return
+    fi
+    local pid
+    pid="$(cat "$PIDFILE")"
+    kill "$pid"
+    for _ in $(seq 1 20); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "Did not exit on SIGTERM; sending SIGKILL."
+        kill -9 "$pid"
+    fi
+    rm -f "$PIDFILE"
+    echo "Stopped."
+}
+
+cmd_status() {
+    local found=0
+    for pf in "$DIR"/asr-server.*.pid; do
+        [[ -e "$pf" ]] || continue
+        local p pid
+        p="$(basename "$pf" .pid)"; p="${p#asr-server.}"
+        pid="$(cat "$pf")"
+        if kill -0 "$pid" 2>/dev/null; then
+            found=1
+            printf "port %s: running (pid %s)  health: " "$p" "$pid"
+            curl -sf --max-time 5 "http://127.0.0.1:$p/health" || echo "unreachable"
+            echo
+        else
+            echo "port $p: stale pidfile (pid $pid dead)"
+        fi
+    done
+    [[ "$found" == 0 ]] && echo "No instances running."
+    if command -v nvidia-smi >/dev/null; then
+        echo "GPU VRAM used: $(nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null || echo n/a)"
+    fi
+}
+
+case "${1:-}" in
+    start) shift; cmd_start "$@" ;;
+    stop) cmd_stop ;;
+    restart) shift; cmd_stop; cmd_start "$@" ;;
+    status) cmd_status ;;
+    logs) tail -f "$LOGFILE" ;;
+    *) sed -n '2,28p' "$0"; exit 2 ;;
+esac

@@ -1,0 +1,66 @@
+{
+  "opening_88s|gpu_chunked": {
+    "wall_s": 38.4,
+    "load_s": 5.374,
+    "infer_s": 32.114,
+    "chars": 1299,
+    "words": 258,
+    "duration_s": 88.82
+  },
+  "opening_88s|cpu_single": {
+    "wall_s": 46.4,
+    "load_s": 8.322,
+    "infer_s": 37.389,
+    "chars": 1299,
+    "words": 258,
+    "duration_s": 88.82
+  },
+  "second_khutba_103s|gpu_chunked": {
+    "wall_s": 38.4,
+    "load_s": 5.298,
+    "infer_s": 31.252,
+    "chars": 979,
+    "words": 166,
+    "duration_s": 103.82
+  },
+  "second_khutba_103s|cpu_single": {
+    "wall_s": 44.4,
+    "load_s": 5.967,
+    "infer_s": 37.328,
+    "chars": 979,
+    "words": 166,
+    "duration_s": 103.82
+  },
+  "convo_159s|gpu_chunked": {
+    "wall_s": 48.4,
+    "load_s": 5.208,
+    "infer_s": 41.824,
+    "chars": 1486,
+    "words": 311,
+    "duration_s": 159.24
+  },
+  "convo_159s|cpu_single": {
+    "wall_s": 52.5,
+    "load_s": 5.618,
+    "infer_s": 44.747,
+    "chars": 1486,
+    "words": 311,
+    "duration_s": 159.24
+  },
+  "first_khutba_1465s|gpu_chunked": {
+    "wall_s": 320.9,
+    "load_s": 5.482,
+    "infer_s": 313.616,
+    "chars": 14986,
+    "words": 2864,
+    "duration_s": 1464.98
+  },
+  "first_khutba_1465s|cpu_single": {
+    "wall_s": 311.4,
+    "load_s": 6.473,
+    "infer_s": 302.859,
+    "chars": 14986,
+    "words": 2864,
+    "duration_s": 1464.98
+  }
+}

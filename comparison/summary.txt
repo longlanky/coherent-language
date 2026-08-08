@@ -1,0 +1,17 @@
+=== opening_88s ===
+  char similarity: 1.0000   word similarity: 1.0000
+  lengths: gpu_chunked 1299 chars/258 words, cpu_single 1299 chars/258 words
+  IDENTICAL
+=== second_khutba_103s ===
+  char similarity: 1.0000   word similarity: 1.0000
+  lengths: gpu_chunked 979 chars/166 words, cpu_single 979 chars/166 words
+  IDENTICAL
+=== convo_159s ===
+  char similarity: 0.9993   word similarity: 0.9968
+  lengths: gpu_chunked 1486 chars/311 words, cpu_single 1486 chars/311 words
+  1 differing word spans; first 5:
+    replace: GPU[الغروزني.] CPU[الغروزنة.]
+=== first_khutba_1465s ===
+  char similarity: 1.0000   word similarity: 1.0000
+  lengths: gpu_chunked 14986 chars/2864 words, cpu_single 14986 chars/2864 words
+  IDENTICAL

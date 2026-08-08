@@ -1,0 +1,16 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime artifacts
+*.log
+*.pid
+
+# Secrets / credentials — never commit
+api.key
+cf.jwt
+.api.key.swp
+
+# Local session helpers
+CONTINUE.sh
