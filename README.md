@@ -31,6 +31,7 @@ Long-form audio (>35 s) is chunked and reassembled automatically.
 | `punctuation` | bool | `true` | `false` gives lower-cased output without punctuation |
 | `max_new_tokens` | int | `256` | Generation cap |
 | `background` | bool | `false` | `true` → return `202` + `job_id` immediately instead of waiting |
+| `cleanup` | bool | `false` | `true` → LLM post-process the transcript (see *LLM post-cleanup*) |
 
 Response:
 
@@ -121,6 +122,27 @@ A user-facing page is served at `/` (API docs stay at `/docs`):
 - Submits with `background=true` and polls, so even long recordings never hit
   proxy timeouts; the transcript appears in a formatted card (RTL-aware) with
   a **Download .txt** button
+
+## LLM post-cleanup (optional)
+
+Pass `cleanup=true` (form field) to post-process the transcript with a local
+ollama LLM (`gemma4:e2b` at `http://10.200.100.5:11434`, override with
+`OLLAMA_HOST` / `OLLAMA_MODEL`). The prompts in
+`llm-post-processing-system-prompt.txt` / `llm-post-processing-user-prompt.txt`
+make it add punctuation/capitalization, format numbers/dates, and
+conservatively remove ASR artifacts while preserving every spoken word
+(including fillers), for English, Arabic, and code-switched text.
+
+- Runs **after** the ASR model is evicted from VRAM, and the LLM is always
+  unloaded afterwards (`keep_alive: 0`) — verified via `/api/ps` → empty and
+  VRAM back at baseline.
+- The result gains a `cleanup` object: `cleaned_text`, `changes[]` (type,
+  original, replacement, reason, confidence), `warnings[]`. On LLM failure the
+  transcription still succeeds and `cleanup.error` is set instead.
+- Web UI: "Clean up transcript with LLM" checkbox → second result card with
+  the cleaned text, per-change highlighted deltas (badge + strikethrough →
+  replacement + reason + confidence), warnings, Copy and Download buttons.
+- CLI: `./transcribe file.mp3 --cleanup` also saves `<name>.cleaned.txt`.
 
 ## Client script (`./transcribe`)
 

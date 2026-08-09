@@ -98,6 +98,8 @@ def main() -> int:
     p.add_argument("--model", default=os.environ.get("ASR_MODEL"), help="Model id (default: server's)")
     p.add_argument("--language", default=os.environ.get("ASR_LANGUAGE"), help="e.g. ar, en")
     p.add_argument("--no-punctuation", action="store_true")
+    p.add_argument("--cleanup", action="store_true",
+                   help="Post-process with the ollama LLM (gemma4:e2b); also saves <name>.cleaned.txt")
     p.add_argument("--cookie", help="Cloudflare Access JWT (CF_Authorization)")
     p.add_argument("--output", help="Transcript output path (default: <audio>.<model>.txt)")
     args = p.parse_args()
@@ -115,7 +117,8 @@ def main() -> int:
         print("note: no Cloudflare cookie found (--cookie / CF_AUTHORIZATION / ./cf.jwt); "
               "the public endpoint may redirect to a login page.", file=sys.stderr)
 
-    fields = {"background": "true", "punctuation": str(not args.no_punctuation).lower()}
+    fields = {"background": "true", "punctuation": str(not args.no_punctuation).lower(),
+              "cleanup": str(args.cleanup).lower()}
     if args.model:
         fields["model"] = args.model
     if args.language:
@@ -153,6 +156,19 @@ def main() -> int:
     print(f"\n--- transcript ({result.get('duration_s')}s audio, {elapsed:.0f}s total) ---\n")
     print(text)
     print(f"\n--- saved to {out} ---")
+
+    cleanup = result.get("cleanup")
+    if cleanup:
+        if cleanup.get("error"):
+            print(f"\n--- LLM cleanup failed: {cleanup['error']} ---")
+        else:
+            cleaned = cleanup.get("cleaned_text", "")
+            cleaned_out = audio.with_suffix(".cleaned.txt")
+            cleaned_out.write_text(cleaned + "\n")
+            print(f"\n--- cleaned transcript ({len(cleanup.get('changes', []))} changes, "
+                  f"{len(cleanup.get('warnings', []))} warnings) ---\n")
+            print(cleaned)
+            print(f"\n--- saved to {cleaned_out} ---")
 
 
 if __name__ == "__main__":

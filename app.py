@@ -8,6 +8,7 @@ Run:  .venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000
 """
 
 import gc
+import json
 import logging
 import os
 import queue
@@ -16,6 +17,7 @@ import tempfile
 import threading
 import uuid
 
+import requests
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
@@ -26,6 +28,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("cohere-asr")
 
 SAMPLE_RATE = 16000
+
+# Optional LLM post-cleanup via a local ollama instance. The prompts live in
+# repo files next to this module.
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://10.200.100.5:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:e2b")
+_here = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(_here, "llm-post-processing-system-prompt.txt")) as _f:
+    _CLEANUP_SYSTEM_PROMPT = _f.read()
+with open(os.path.join(_here, "llm-post-processing-user-prompt.txt")) as _f:
+    _CLEANUP_USER_TEMPLATE = _f.read()
 
 MODELS = {
     "cohere-transcribe-03-2026": {
@@ -93,6 +105,59 @@ def unload_models():
         log.info("Unloading %s", old_name)
         del _loaded[old_name]
     _free_vram()
+
+
+def _unload_ollama():
+    """Force the ollama model out of RAM/VRAM (keep_alive=0)."""
+    try:
+        requests.post(f"{OLLAMA_HOST}/api/generate",
+                      json={"model": OLLAMA_MODEL, "keep_alive": 0}, timeout=30)
+        log.info("Unloaded %s from ollama", OLLAMA_MODEL)
+    except Exception:
+        log.warning("Failed to unload %s from ollama", OLLAMA_MODEL, exc_info=True)
+
+
+def run_cleanup(raw_text: str) -> dict:
+    """Post-process a transcript with the ollama LLM.
+
+    Returns {"cleaned_text", "changes", "warnings"} on success, or
+    {"error": ...} on failure. The ollama model is always unloaded again.
+    """
+    log.info("Running LLM cleanup with %s (%d chars)", OLLAMA_MODEL, len(raw_text))
+    try:
+        resp = requests.post(
+            f"{OLLAMA_HOST}/api/chat",
+            json={
+                "model": OLLAMA_MODEL,
+                "messages": [
+                    {"role": "system", "content": _CLEANUP_SYSTEM_PROMPT},
+                    {"role": "user", "content": _CLEANUP_USER_TEMPLATE.replace(
+                        "{raw_transcript}", raw_text)},
+                ],
+                "stream": False,
+                "format": "json",
+            },
+            timeout=900,  # long transcripts on a shared 4 GB GPU can take minutes
+        )
+        resp.raise_for_status()
+        content = resp.json()["message"]["content"]
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            # Tolerate stray markdown fences despite format:"json".
+            data = json.loads(content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip())
+        if not isinstance(data, dict) or "cleaned_text" not in data:
+            raise ValueError(f"unexpected cleanup payload: {str(data)[:200]}")
+        data.setdefault("changes", [])
+        data.setdefault("warnings", [])
+        log.info("Cleanup done: %d changes, %d warnings",
+                 len(data["changes"]), len(data["warnings"]))
+        return data
+    except Exception as exc:
+        log.exception("LLM cleanup failed")
+        return {"error": str(exc)}
+    finally:
+        _unload_ollama()
 
 
 def get_model(name: str):
@@ -287,22 +352,27 @@ _job_queue: queue.Queue = queue.Queue()
 
 def _job_worker():
     while True:
-        job_id, audio_path, model, language, punctuation, max_new_tokens = _job_queue.get()
+        job_id, audio_path, model, language, punctuation, max_new_tokens, cleanup = _job_queue.get()
         _jobs[job_id]["status"] = "running"
         with _model_lock:
             try:
                 result = _transcribe(audio_path, model, language, punctuation, max_new_tokens)
             except HTTPException as exc:
                 _jobs[job_id].update(status="failed", error=exc.detail)
+                result = None
             except Exception as exc:
                 log.exception("Job %s failed", job_id)
                 _jobs[job_id].update(status="failed", error=str(exc))
-            else:
-                _jobs[job_id].update(status="done", result=result)
+                result = None
             # Except-block names are cleared before this runs, so no live
             # traceback pins the model in memory here.
             unload_models()
             os.unlink(audio_path)
+            if result is not None and cleanup:
+                # ASR model is out of VRAM now; gemma gets the GPU to itself.
+                result["cleanup"] = run_cleanup(result["text"])
+            if result is not None:
+                _jobs[job_id].update(status="done", result=result)
 
 
 threading.Thread(target=_job_worker, daemon=True, name="asr-jobs").start()
@@ -324,6 +394,7 @@ def transcribe(
     punctuation: bool = Form(True),
     max_new_tokens: int = Form(256),
     background: bool = Form(False),
+    cleanup: bool = Form(False),
 ):
     if model not in MODELS:
         raise HTTPException(
@@ -336,7 +407,7 @@ def transcribe(
         # Return immediately; the client polls /v1/audio/transcriptions/jobs/<id>.
         job_id = uuid.uuid4().hex
         _jobs[job_id] = {"status": "queued", "model": model}
-        _job_queue.put((job_id, audio_path, model, language, punctuation, max_new_tokens))
+        _job_queue.put((job_id, audio_path, model, language, punctuation, max_new_tokens, cleanup))
         return JSONResponse(status_code=202, content={"job_id": job_id, "status": "queued", "model": model})
 
     # The whole request lifecycle runs under one lock: two models are never
@@ -361,6 +432,9 @@ def transcribe(
         # live traceback) references the model, so its tensors can be freed.
         unload_models()
         os.unlink(audio_path)
+        if status_code is None and cleanup:
+            # ASR model is out of VRAM now; gemma gets the GPU to itself.
+            result["cleanup"] = run_cleanup(result["text"])
 
     if status_code is None:
         return result

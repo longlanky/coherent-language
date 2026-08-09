@@ -99,7 +99,7 @@
   }
   #status.error { background: var(--error); color: #fff; }
   #result-card { display: none; margin-top: 20px; }
-  #result-text {
+  #result-text, #cleaned-text {
     white-space: pre-wrap; line-height: 1.7; font-size: 1.02rem;
     background: var(--bg-inset); border-radius: 8px; padding: 16px;
     max-height: 420px; overflow-y: auto;
@@ -110,6 +110,33 @@
     background: var(--accent); color: #fff; border: none; font-size: 0.95rem;
   }
   #download-btn:hover { background: var(--accent-hover); }
+  .cleanup-row { margin-top: 14px; color: var(--text); font-size: 0.95rem; }
+  .cleanup-row input { margin-right: 6px; }
+  #cleaned-card { display: none; margin-top: 20px; }
+  .badge {
+    display: inline-block; padding: 2px 9px; border-radius: 10px;
+    font-size: 0.75rem; font-weight: 600; color: #fff;
+  }
+  .badge-punctuation_added, .badge-capitalization { background: #7d9b6e; }
+  .badge-formatting { background: #6e8b9b; }
+  .badge-hallucination_removed, .badge-garbled_removed { background: #a3564b; }
+  .badge-repetition_collapsed { background: #9b8a5a; }
+  .badge-other { background: #8a7d9b; }
+  .confidence { font-size: 0.75rem; color: var(--text-soft); font-style: italic; }
+  .change-row {
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; margin-top: 8px; background: var(--bg-inset);
+    font-size: 0.9rem; line-height: 1.6;
+  }
+  .change-row .orig { text-decoration: line-through; color: var(--error); }
+  .change-row .repl { background: var(--accent-soft); border-radius: 4px; padding: 0 4px; }
+  .change-row .reason { color: var(--text-soft); font-size: 0.83rem; display: block; margin-top: 4px; }
+  .warning-item { color: var(--text-soft); font-size: 0.87rem; margin-top: 6px; }
+  #copy-btn, #download-cleaned-btn {
+    margin-top: 14px; margin-right: 8px; padding: 9px 18px; border-radius: 8px;
+    cursor: pointer; background: var(--accent); color: #fff; border: none; font-size: 0.95rem;
+  }
+  #copy-btn:hover, #download-cleaned-btn:hover { background: var(--accent-hover); }
   footer { text-align: center; color: var(--text-soft); font-size: 0.8rem; padding: 24px; }
   footer a { color: var(--accent); }
 </style>
@@ -137,6 +164,9 @@
     <label for="lang-select">Language</label>
     <select id="lang-select"></select>
 
+    <label class="cleanup-row"><input type="checkbox" id="cleanup">
+      Clean up transcript with LLM (gemma4:e2b — punctuation, formatting, artifact removal; slower)</label>
+
     <details>
       <summary>Advanced settings</summary>
       <div class="adv-row">
@@ -154,6 +184,16 @@
     <div id="result-text" dir="auto"></div>
     <div class="meta" id="result-meta"></div>
     <button id="download-btn">⬇️ Download .txt</button>
+  </div>
+
+  <div class="card" id="cleaned-card">
+    <label>Cleaned transcript <span class="meta" style="margin:0">(LLM post-processed)</span></label>
+    <div id="cleaned-text" dir="auto"></div>
+    <div class="meta" id="cleaned-meta"></div>
+    <button id="copy-btn">📋 Copy text</button>
+    <button id="download-cleaned-btn">⬇️ Download .txt</button>
+    <div id="changes-list"></div>
+    <div id="warnings-list"></div>
   </div>
 </main>
 
@@ -227,6 +267,7 @@ function setAudio(blob, name) {
   fileName.textContent = name + " (" + (blob.size / 1048576).toFixed(1) + " MiB)";
   submitBtn.disabled = false;
   resultCard.style.display = "none";
+  cleanedCard.style.display = "none";
   hideStatus();
 }
 pickBtn.onclick = () => fileInput.click();
@@ -268,6 +309,71 @@ recordBtn.onclick = async () => {
   }
 };
 
+// --- cleanup result rendering ---
+const cleanedCard = $("cleaned-card"), cleanedText = $("cleaned-text"),
+      cleanedMeta = $("cleaned-meta"), changesList = $("changes-list"),
+      warningsList = $("warnings-list"), copyBtn = $("copy-btn"),
+      downloadCleanedBtn = $("download-cleaned-btn");
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function renderCleanup(cleanup, lang, durationS) {
+  cleanedCard.style.display = "none";
+  changesList.innerHTML = "";
+  warningsList.innerHTML = "";
+  if (!cleanup) return;
+  if (cleanup.error) {
+    cleanedCard.style.display = "block";
+    cleanedText.textContent = "";
+    cleanedMeta.textContent = "LLM cleanup failed (transcript above is unaffected): " + cleanup.error;
+    return;
+  }
+  cleanedText.textContent = cleanup.cleaned_text || "";
+  cleanedText.dir = lang === "ar" ? "rtl" : "auto";
+  const nChanges = (cleanup.changes || []).length;
+  cleanedMeta.textContent = `${nChanges} change${nChanges === 1 ? "" : "s"} applied` +
+    (cleanup.warnings && cleanup.warnings.length ? ` · ${cleanup.warnings.length} warning(s)` : "");
+
+  copyBtn.onclick = async () => {
+    await navigator.clipboard.writeText(cleanup.cleaned_text || "");
+    copyBtn.textContent = "✓ Copied";
+    setTimeout(() => { copyBtn.textContent = "📋 Copy text"; }, 1500);
+  };
+  downloadCleanedBtn.onclick = () => {
+    const blob = new Blob([(cleanup.cleaned_text || "") + "\n"], { type: "text/plain;charset=utf-8" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = audioName.replace(/\.[^.]+$/, "") + ".cleaned.txt";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
+  for (const ch of cleanup.changes || []) {
+    const type = ch.type || "other";
+    const row = document.createElement("div");
+    row.className = "change-row";
+    row.dir = "auto";
+    row.innerHTML =
+      `<span class="badge badge-${esc(type)}">${esc(type.replaceAll("_", " "))}</span> ` +
+      (ch.original ? `<span class="orig">${esc(ch.original)}</span> → ` : "+ ") +
+      (ch.replacement ? `<span class="repl">${esc(ch.replacement)}</span>` : `<span class="confidence">(removed)</span>`) +
+      ` <span class="confidence">${esc(ch.confidence || "")}</span>` +
+      (ch.reason ? `<span class="reason">${esc(ch.reason)}</span>` : "");
+    changesList.appendChild(row);
+  }
+  for (const w of cleanup.warnings || []) {
+    const div = document.createElement("div");
+    div.className = "warning-item";
+    div.dir = "auto";
+    div.textContent = "⚠️ " + w;
+    warningsList.appendChild(div);
+  }
+  cleanedCard.style.display = "block";
+}
+
 // --- submit + poll ---
 function showStatus(msg, isError) {
   statusBox.textContent = msg;
@@ -290,6 +396,7 @@ submitBtn.onclick = async () => {
   form.append("punctuation", $("punctuation").checked);
   form.append("max_new_tokens", $("max-new-tokens").value);
   form.append("background", "true");
+  form.append("cleanup", $("cleanup").checked);
 
   const t0 = Date.now();
   try {
@@ -325,6 +432,7 @@ submitBtn.onclick = async () => {
       URL.revokeObjectURL(a.href);
     };
     resultCard.style.display = "block";
+    renderCleanup(res.cleanup, lang, res.duration_s);
     hideStatus();
     resultCard.scrollIntoView({ behavior: "smooth" });
   } catch (err) {
