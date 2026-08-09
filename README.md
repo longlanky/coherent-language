@@ -104,6 +104,24 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions \
 
 Interactive API docs (FastAPI/Swagger): http://localhost:8000/docs
 
+## Web UI (`/`)
+
+A user-facing page is served at `/` (API docs stay at `/docs`):
+
+- Light/dark theme toggle (natural sand/olive palette; persisted in
+  `localStorage`, follows `prefers-color-scheme` by default)
+- Audio file upload (accept: wav, mp3, m4a, ogg, flac, webm, aac) **and**
+  in-browser microphone recording (MediaRecorder → webm/ogg; the server
+  converts via an ffmpeg fallback when librosa can't decode the container)
+- Model picker with the `-int8enc` quantized variants preselected/recommended;
+  language picker scoped to the chosen model family with full names
+  (`en - English`, `ar+en - Arabic / English (mixed, code-switched)`, …)
+- Advanced settings (punctuation, max_new_tokens) tucked behind a collapsed
+  details section
+- Submits with `background=true` and polls, so even long recordings never hit
+  proxy timeouts; the transcript appears in a formatted card (RTL-aware) with
+  a **Download .txt** button
+
 ## Client script (`./transcribe`)
 
 Wraps the whole flow — file selection, upload, background polling (immune to
@@ -266,6 +284,7 @@ python3 -m venv .venv
 ```
 cohere-asr/
 ├── app.py             # FastAPI service (single file)
+├── static/index.html  # web UI served at /
 ├── quant.py           # INT8 encoder quantization (Int8Linear)
 ├── asr-server         # daemon manager (start/stop/status/logs)
 ├── transcribe         # CLI client (upload + poll + save)

@@ -11,13 +11,14 @@ import gc
 import logging
 import os
 import queue
+import subprocess
 import tempfile
 import threading
 import uuid
 
 import torch
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
 from transformers import AutoProcessor, CohereAsrForConditionalGeneration
 from transformers.audio_utils import load_audio
 
@@ -140,6 +141,17 @@ def get_model(name: str):
     return _loaded[name]
 
 
+@app.get("/", include_in_schema=False)
+def index():
+    return FileResponse(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "static", "index.html"))
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return Response(status_code=204)
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -180,8 +192,23 @@ def _transcribe(audio_path: str, model: str, language: str | None,
 
     try:
         audio = load_audio(audio_path, sampling_rate=SAMPLE_RATE)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not decode audio: {exc}")
+    except Exception as first_exc:
+        # Some containers (e.g. webm/opus from browser MediaRecorder) aren't
+        # decodable by librosa — convert to 16 kHz mono wav with ffmpeg and retry.
+        wav_path = audio_path + ".ffmpeg.wav"
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-i", audio_path,
+                 "-ar", str(SAMPLE_RATE), "-ac", "1", wav_path],
+                check=True, capture_output=True, timeout=300,
+            )
+            audio = load_audio(wav_path, sampling_rate=SAMPLE_RATE)
+        except Exception:
+            raise HTTPException(status_code=400,
+                                detail=f"Could not decode audio: {first_exc}")
+        finally:
+            if os.path.exists(wav_path):
+                os.unlink(wav_path)
 
     duration_s = len(audio) / SAMPLE_RATE
     inputs = processor(

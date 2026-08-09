@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cohere Transcribe — Speech to Text</title>
+<style>
+  :root {
+    --bg: #f7f4ec;          /* warm sand */
+    --bg-card: #fffdf7;
+    --bg-inset: #efe9db;
+    --text: #3a362c;
+    --text-soft: #6f6857;
+    --accent: #5f7a54;      /* sage */
+    --accent-hover: #4c6444;
+    --accent-soft: #dde5d3;
+    --border: #ddd5c2;
+    --error: #a3564b;
+    --shadow: 0 2px 10px rgba(90, 80, 55, 0.08);
+  }
+  [data-theme="dark"] {
+    --bg: #232820;          /* forest night */
+    --bg-card: #2b3128;
+    --bg-inset: #343b30;
+    --text: #e8e4d8;
+    --text-soft: #a9a493;
+    --accent: #8ba87c;
+    --accent-hover: #9db98d;
+    --accent-soft: #3d4a38;
+    --border: #46503f;
+    --error: #d08a7d;
+    --shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    transition: background 0.25s, color 0.25s;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    max-width: 760px; margin: 0 auto; padding: 20px 20px 0;
+  }
+  h1 { font-size: 1.35rem; margin: 0; font-weight: 600; }
+  h1 .sub { color: var(--text-soft); font-weight: 400; font-size: 0.95rem; }
+  #theme-toggle {
+    background: var(--bg-card); color: var(--text);
+    border: 1px solid var(--border); border-radius: 20px;
+    padding: 6px 14px; cursor: pointer; font-size: 0.9rem;
+    transition: background 0.25s, color 0.25s, border 0.25s;
+  }
+  #theme-toggle:hover { border-color: var(--accent); }
+  main { max-width: 760px; margin: 0 auto; padding: 20px; }
+  .card {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 24px; box-shadow: var(--shadow);
+    transition: background 0.25s, border 0.25s;
+  }
+  label { display: block; font-weight: 600; margin: 18px 0 6px; font-size: 0.95rem; }
+  label:first-child { margin-top: 0; }
+  select, input[type="number"] {
+    width: 100%; padding: 9px 10px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    font-size: 0.95rem;
+  }
+  .file-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .file-btn, #record-btn {
+    padding: 10px 16px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--bg-inset); color: var(--text);
+    font-size: 0.95rem; transition: border-color 0.2s;
+  }
+  .file-btn:hover, #record-btn:hover { border-color: var(--accent); }
+  #record-btn.recording { background: var(--error); color: #fff; border-color: var(--error); }
+  #file-name { color: var(--text-soft); font-size: 0.9rem; }
+  #file-input { display: none; }
+  details {
+    margin-top: 18px; border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 14px; background: var(--bg-inset);
+  }
+  summary { cursor: pointer; color: var(--text-soft); font-size: 0.9rem; }
+  details[open] summary { margin-bottom: 8px; }
+  .adv-row { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+  .adv-row label { margin: 6px 0; font-weight: 400; }
+  .adv-row input[type="number"] { width: 110px; }
+  #submit-btn {
+    margin-top: 22px; width: 100%; padding: 12px;
+    background: var(--accent); color: #fff; border: none; border-radius: 8px;
+    font-size: 1rem; font-weight: 600; cursor: pointer; transition: background 0.2s;
+  }
+  #submit-btn:hover { background: var(--accent-hover); }
+  #submit-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  #status {
+    margin-top: 16px; padding: 12px 14px; border-radius: 8px;
+    background: var(--accent-soft); color: var(--text);
+    font-size: 0.92rem; display: none;
+  }
+  #status.error { background: var(--error); color: #fff; }
+  #result-card { display: none; margin-top: 20px; }
+  #result-text {
+    white-space: pre-wrap; line-height: 1.7; font-size: 1.02rem;
+    background: var(--bg-inset); border-radius: 8px; padding: 16px;
+    max-height: 420px; overflow-y: auto;
+  }
+  .meta { color: var(--text-soft); font-size: 0.85rem; margin-top: 10px; }
+  #download-btn {
+    margin-top: 14px; padding: 9px 18px; border-radius: 8px; cursor: pointer;
+    background: var(--accent); color: #fff; border: none; font-size: 0.95rem;
+  }
+  #download-btn:hover { background: var(--accent-hover); }
+  footer { text-align: center; color: var(--text-soft); font-size: 0.8rem; padding: 24px; }
+  footer a { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Cohere Transcribe <span class="sub">speech to text</span></h1>
+  <button id="theme-toggle" title="Toggle light / dark theme">🌙 dark</button>
+</header>
+
+<main>
+  <div class="card">
+    <label>Audio</label>
+    <div class="file-row">
+      <button class="file-btn" id="pick-btn" type="button">📁 Choose file</button>
+      <input type="file" id="file-input"
+             accept=".wav,.mp3,.m4a,.ogg,.oga,.flac,.webm,.aac,audio/*">
+      <button id="record-btn" type="button">🎙️ Record</button>
+      <span id="file-name">no audio selected</span>
+    </div>
+
+    <label for="model-select">Model</label>
+    <select id="model-select"></select>
+
+    <label for="lang-select">Language</label>
+    <select id="lang-select"></select>
+
+    <details>
+      <summary>Advanced settings</summary>
+      <div class="adv-row">
+        <label><input type="checkbox" id="punctuation" checked> punctuation</label>
+        <label>max new tokens <input type="number" id="max-new-tokens" value="256" min="16" max="1024"></label>
+      </div>
+    </details>
+
+    <button id="submit-btn" disabled>Transcribe</button>
+    <div id="status"></div>
+  </div>
+
+  <div class="card" id="result-card">
+    <label>Transcription</label>
+    <div id="result-text" dir="auto"></div>
+    <div class="meta" id="result-meta"></div>
+    <button id="download-btn">⬇️ Download .txt</button>
+  </div>
+</main>
+
+<footer>API documentation at <a href="/docs">/docs</a></footer>
+
+<script>
+"use strict";
+
+const MODELS = [
+  { id: "cohere-transcribe-arabic-07-2026-int8enc", label: "Arabic (recommended, fast)", family: "arabic" },
+  { id: "cohere-transcribe-arabic-07-2026",         label: "Arabic (full precision)",    family: "arabic" },
+  { id: "cohere-transcribe-03-2026-int8enc",        label: "Multilingual (recommended, fast)", family: "general" },
+  { id: "cohere-transcribe-03-2026",                label: "Multilingual (full precision)",    family: "general" },
+];
+const LANGS = {
+  arabic: [
+    ["ar", "ar - Arabic"],
+    ["ar+en", "ar+en - Arabic / English (mixed, code-switched)"],
+    ["en", "en - English"],
+  ],
+  general: [
+    ["en", "en - English"], ["ar", "ar - Arabic"], ["fr", "fr - French"],
+    ["de", "de - German"], ["es", "es - Spanish"], ["it", "it - Italian"],
+    ["pt", "pt - Portuguese"], ["nl", "nl - Dutch"], ["pl", "pl - Polish"],
+    ["el", "el - Greek"], ["ja", "ja - Japanese"], ["zh", "zh - Chinese"],
+    ["ko", "ko - Korean"], ["vi", "vi - Vietnamese"],
+  ],
+};
+
+const $ = (id) => document.getElementById(id);
+const themeToggle = $("theme-toggle"), pickBtn = $("pick-btn"), fileInput = $("file-input"),
+      recordBtn = $("record-btn"), fileName = $("file-name"), modelSelect = $("model-select"),
+      langSelect = $("lang-select"), submitBtn = $("submit-btn"), statusBox = $("status"),
+      resultCard = $("result-card"), resultText = $("result-text"),
+      resultMeta = $("result-meta"), downloadBtn = $("download-btn");
+
+let audioBlob = null, audioName = null, mediaRecorder = null, recordTimer = null, recordStart = 0;
+
+// --- theme ---
+function setTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  themeToggle.textContent = theme === "dark" ? "☀️ light" : "🌙 dark";
+  localStorage.setItem("asr-theme", theme);
+}
+setTheme(localStorage.getItem("asr-theme")
+  || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
+themeToggle.onclick = () =>
+  setTheme(document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark");
+
+// --- model / language selects ---
+for (const m of MODELS) {
+  const opt = document.createElement("option");
+  opt.value = m.id; opt.textContent = m.label;
+  modelSelect.appendChild(opt);
+}
+function refreshLangs() {
+  const family = MODELS[modelSelect.selectedIndex].family;
+  langSelect.innerHTML = "";
+  for (const [code, label] of LANGS[family]) {
+    const opt = document.createElement("option");
+    opt.value = code; opt.textContent = label;
+    langSelect.appendChild(opt);
+  }
+}
+modelSelect.onchange = refreshLangs;
+refreshLangs();
+
+// --- audio selection ---
+function setAudio(blob, name) {
+  audioBlob = blob; audioName = name;
+  fileName.textContent = name + " (" + (blob.size / 1048576).toFixed(1) + " MiB)";
+  submitBtn.disabled = false;
+  resultCard.style.display = "none";
+  hideStatus();
+}
+pickBtn.onclick = () => fileInput.click();
+fileInput.onchange = () => { if (fileInput.files[0]) setAudio(fileInput.files[0], fileInput.files[0].name); };
+
+// --- recording ---
+recordBtn.onclick = async () => {
+  if (mediaRecorder && mediaRecorder.state === "recording") {
+    mediaRecorder.stop();
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mime = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", ""]
+      .find((m) => !m || MediaRecorder.isTypeSupported(m));
+    mediaRecorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+    const ext = (mediaRecorder.mimeType.includes("ogg") ? "ogg" : "webm");
+    const chunks = [];
+    mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
+    mediaRecorder.onstop = () => {
+      stream.getTracks().forEach((t) => t.stop());
+      clearInterval(recordTimer);
+      recordBtn.textContent = "🎙️ Record";
+      recordBtn.classList.remove("recording");
+      const blob = new Blob(chunks, { type: mediaRecorder.mimeType });
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      setAudio(blob, `recording-${stamp}.${ext}`);
+    };
+    mediaRecorder.start();
+    recordStart = Date.now();
+    recordBtn.classList.add("recording");
+    recordBtn.textContent = "⏹️ Stop (0:00)";
+    recordTimer = setInterval(() => {
+      const s = Math.floor((Date.now() - recordStart) / 1000);
+      recordBtn.textContent = `⏹️ Stop (${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")})`;
+    }, 500);
+  } catch (err) {
+    showStatus("Microphone unavailable: " + err.message, true);
+  }
+};
+
+// --- submit + poll ---
+function showStatus(msg, isError) {
+  statusBox.textContent = msg;
+  statusBox.className = isError ? "error" : "";
+  statusBox.style.display = "block";
+}
+function hideStatus() { statusBox.style.display = "none"; }
+
+submitBtn.onclick = async () => {
+  if (!audioBlob) return;
+  submitBtn.disabled = true;
+  resultCard.style.display = "none";
+  showStatus("Uploading " + audioName + " …");
+
+  const form = new FormData();
+  form.append("file", audioBlob, audioName);
+  form.append("model", modelSelect.value);
+  const lang = langSelect.value === "ar+en" ? "ar" : langSelect.value;  // mixed → ar mode
+  form.append("language", lang);
+  form.append("punctuation", $("punctuation").checked);
+  form.append("max_new_tokens", $("max-new-tokens").value);
+  form.append("background", "true");
+
+  const t0 = Date.now();
+  try {
+    const submitResp = await fetch("/v1/audio/transcriptions", { method: "POST", body: form });
+    if (!submitResp.ok) throw new Error((await submitResp.text()).slice(0, 300));
+    const job = await submitResp.json();
+
+    let jobStatus;
+    while (true) {
+      await new Promise((r) => setTimeout(r, 3000));
+      const poll = await fetch(`/v1/audio/transcriptions/jobs/${job.job_id}`);
+      if (!poll.ok) throw new Error("polling failed (HTTP " + poll.status + ")");
+      jobStatus = await poll.json();
+      const elapsed = Math.floor((Date.now() - t0) / 1000);
+      showStatus(`Transcribing… status: ${jobStatus.status}, ${elapsed}s elapsed. ` +
+                 "Long recordings take a while — this page will update by itself.");
+      if (jobStatus.status === "done" || jobStatus.status === "failed") break;
+    }
+    if (jobStatus.status === "failed") throw new Error(jobStatus.error || "unknown error");
+
+    const res = jobStatus.result;
+    resultText.textContent = res.text;
+    resultText.dir = lang === "ar" ? "rtl" : "auto";
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(0);
+    resultMeta.textContent =
+      `${res.duration_s}s of audio · model ${res.model} · language ${res.language} · finished in ${elapsed}s`;
+    downloadBtn.onclick = () => {
+      const blob = new Blob([res.text + "\n"], { type: "text/plain;charset=utf-8" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = audioName.replace(/\.[^.]+$/, "") + "." + res.model + ".txt";
+      a.click();
+      URL.revokeObjectURL(a.href);
+    };
+    resultCard.style.display = "block";
+    hideStatus();
+    resultCard.scrollIntoView({ behavior: "smooth" });
+  } catch (err) {
+    showStatus("Error: " + err.message, true);
+  } finally {
+    submitBtn.disabled = false;
+  }
+};
+</script>
+</body>
+</html>
