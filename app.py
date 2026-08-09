@@ -117,39 +117,71 @@ def _unload_ollama():
         log.warning("Failed to unload %s from ollama", OLLAMA_MODEL, exc_info=True)
 
 
-def run_cleanup(raw_text: str) -> dict:
+def _ollama_chat(messages: list[dict]) -> str:
+    """One JSON-mode chat call; returns the message content string."""
+    resp = requests.post(
+        f"{OLLAMA_HOST}/api/chat",
+        json={"model": OLLAMA_MODEL, "messages": messages,
+              "stream": False, "format": "json"},
+        timeout=900,  # long transcripts on a shared 4 GB GPU can take minutes
+    )
+    resp.raise_for_status()
+    return resp.json()["message"]["content"]
+
+
+def _parse_json(content: str) -> dict:
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        # Tolerate stray markdown fences despite format:"json".
+        data = json.loads(content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip())
+    if not isinstance(data, dict):
+        raise ValueError(f"unexpected payload: {content[:200]}")
+    return data
+
+
+def run_cleanup(raw_text: str, translate_to: str | None = None) -> dict:
     """Post-process a transcript with the ollama LLM.
 
     Returns {"cleaned_text", "changes", "warnings"} on success, or
     {"error": ...} on failure. The ollama model is always unloaded again.
+
+    When translate_to is set (e.g. "French" or "Levantine Arabic") a second
+    LLM pass translates the cleaned text — a single combined prompt proved
+    unreliable (the model returned untranslated cleaned text). cleaned_text
+    then holds the translation; changes/warnings come from the cleaning pass.
     """
-    log.info("Running LLM cleanup with %s (%d chars)", OLLAMA_MODEL, len(raw_text))
+    log.info("Running LLM cleanup with %s (%d chars, translate_to=%s)",
+             OLLAMA_MODEL, len(raw_text), translate_to)
     try:
-        resp = requests.post(
-            f"{OLLAMA_HOST}/api/chat",
-            json={
-                "model": OLLAMA_MODEL,
-                "messages": [
-                    {"role": "system", "content": _CLEANUP_SYSTEM_PROMPT},
-                    {"role": "user", "content": _CLEANUP_USER_TEMPLATE.replace(
-                        "{raw_transcript}", raw_text)},
-                ],
-                "stream": False,
-                "format": "json",
-            },
-            timeout=900,  # long transcripts on a shared 4 GB GPU can take minutes
-        )
-        resp.raise_for_status()
-        content = resp.json()["message"]["content"]
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError:
-            # Tolerate stray markdown fences despite format:"json".
-            data = json.loads(content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip())
-        if not isinstance(data, dict) or "cleaned_text" not in data:
+        content = _ollama_chat([
+            {"role": "system", "content": _CLEANUP_SYSTEM_PROMPT},
+            {"role": "user", "content": _CLEANUP_USER_TEMPLATE.replace("{raw_transcript}", raw_text)},
+        ])
+        data = _parse_json(content)
+        if "cleaned_text" not in data:
             raise ValueError(f"unexpected cleanup payload: {str(data)[:200]}")
         data.setdefault("changes", [])
         data.setdefault("warnings", [])
+
+        if translate_to:
+            log.info("Translating cleaned text to %s", translate_to)
+            tr_content = _ollama_chat([
+                {"role": "system", "content": (
+                    "You are a professional translator. Translate the user's text "
+                    f"into {translate_to}. Translate faithfully and completely — do "
+                    "not summarize, condense, or omit anything, and do not add "
+                    "commentary. Return ONLY a JSON object of the form "
+                    '{"translation": "..."}.')},
+                {"role": "user", "content": data["cleaned_text"]},
+            ])
+            tr_data = _parse_json(tr_content)
+            translated = tr_data.get("translation") or tr_data.get("cleaned_text")
+            if not translated:
+                raise ValueError(f"unexpected translation payload: {tr_content[:200]}")
+            data["cleaned_text"] = translated
+            data["translation"] = {"target": translate_to}
+
         log.info("Cleanup done: %d changes, %d warnings",
                  len(data["changes"]), len(data["warnings"]))
         return data
@@ -340,6 +372,15 @@ def _save_upload(file: UploadFile) -> str:
         return tmp.name
 
 
+def _translate_target(lang: str, modifier: str) -> str | None:
+    """Combine the translate form fields into a target like "Levantine Arabic".
+    Length-capped; returns None when no language was given."""
+    lang, modifier = lang.strip()[:60], modifier.strip()[:40]
+    if not lang:
+        return None
+    return f"{modifier} {lang}".strip() if modifier else lang
+
+
 # --- Background jobs -------------------------------------------------------
 # Long recordings exceed proxy timeouts (e.g. Cloudflare's 100 s), so clients
 # can submit with background=true and poll for the result. One worker thread;
@@ -352,7 +393,8 @@ _job_queue: queue.Queue = queue.Queue()
 
 def _job_worker():
     while True:
-        job_id, audio_path, model, language, punctuation, max_new_tokens, cleanup = _job_queue.get()
+        (job_id, audio_path, model, language, punctuation, max_new_tokens,
+         cleanup, translate_to) = _job_queue.get()
         _jobs[job_id]["status"] = "running"
         with _model_lock:
             try:
@@ -370,7 +412,7 @@ def _job_worker():
             os.unlink(audio_path)
             if result is not None and cleanup:
                 # ASR model is out of VRAM now; gemma gets the GPU to itself.
-                result["cleanup"] = run_cleanup(result["text"])
+                result["cleanup"] = run_cleanup(result["text"], translate_to)
             if result is not None:
                 _jobs[job_id].update(status="done", result=result)
 
@@ -395,6 +437,8 @@ def transcribe(
     max_new_tokens: int = Form(256),
     background: bool = Form(False),
     cleanup: bool = Form(False),
+    translate_lang: str = Form(""),
+    translate_modifier: str = Form(""),
 ):
     if model not in MODELS:
         raise HTTPException(
@@ -402,12 +446,14 @@ def transcribe(
             detail=f"Unknown model '{model}'. Available: {sorted(MODELS)}",
         )
     audio_path = _save_upload(file)
+    translate_to = _translate_target(translate_lang, translate_modifier) if cleanup else None
 
     if background:
         # Return immediately; the client polls /v1/audio/transcriptions/jobs/<id>.
         job_id = uuid.uuid4().hex
         _jobs[job_id] = {"status": "queued", "model": model}
-        _job_queue.put((job_id, audio_path, model, language, punctuation, max_new_tokens, cleanup))
+        _job_queue.put((job_id, audio_path, model, language, punctuation, max_new_tokens,
+                        cleanup, translate_to))
         return JSONResponse(status_code=202, content={"job_id": job_id, "status": "queued", "model": model})
 
     # The whole request lifecycle runs under one lock: two models are never
@@ -434,7 +480,7 @@ def transcribe(
         os.unlink(audio_path)
         if status_code is None and cleanup:
             # ASR model is out of VRAM now; gemma gets the GPU to itself.
-            result["cleanup"] = run_cleanup(result["text"])
+            result["cleanup"] = run_cleanup(result["text"], translate_to)
 
     if status_code is None:
         return result

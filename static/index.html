@@ -112,6 +112,13 @@
   #download-btn:hover { background: var(--accent-hover); }
   .cleanup-row { margin-top: 14px; color: var(--text); font-size: 0.95rem; }
   .cleanup-row input { margin-right: 6px; }
+  .translate-inputs { display: flex; gap: 10px; margin: 8px 0 0 24px; flex-wrap: wrap; }
+  .translate-inputs input {
+    flex: 1; min-width: 180px; padding: 8px 10px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    font-size: 0.92rem;
+  }
+  .translate-inputs input:disabled { opacity: 0.5; }
   #cleaned-card { display: none; margin-top: 20px; }
   .badge {
     display: inline-block; padding: 2px 9px; border-radius: 10px;
@@ -166,6 +173,18 @@
 
     <label class="cleanup-row"><input type="checkbox" id="cleanup">
       Clean up transcript with LLM (gemma4:e2b — punctuation, formatting, artifact removal; slower)</label>
+
+    <div id="translate-block">
+      <label class="cleanup-row"><input type="checkbox" id="translate" disabled>
+        Translate cleaned transcript</label>
+      <div class="translate-inputs">
+        <input type="text" id="translate-lang" list="lang-list" maxlength="60"
+               placeholder="target language — start typing…" disabled autocomplete="off">
+        <datalist id="lang-list"></datalist>
+        <input type="text" id="translate-modifier" maxlength="40"
+               placeholder="modifier, e.g. Levantine (optional)" disabled autocomplete="off">
+      </div>
+    </div>
 
     <details>
       <summary>Advanced settings</summary>
@@ -261,6 +280,40 @@ function refreshLangs() {
 modelSelect.onchange = refreshLangs;
 refreshLangs();
 
+// --- translation options ---
+const TRANSLATE_LANGS = [
+  "Afrikaans","Albanian","Amharic","Arabic","Armenian","Azerbaijani","Basque","Belarusian",
+  "Bengali","Bosnian","Bulgarian","Burmese","Catalan","Cebuano","Chinese (Mandarin)",
+  "Chinese (Cantonese)","Croatian","Czech","Danish","Dutch","English","Estonian","Finnish",
+  "French","Galician","Georgian","German","Greek","Gujarati","Haitian Creole","Hausa","Hebrew",
+  "Hindi","Hungarian","Icelandic","Igbo","Indonesian","Irish","Italian","Japanese","Javanese",
+  "Kannada","Kazakh","Khmer","Korean","Kurdish","Kyrgyz","Lao","Latvian","Lithuanian",
+  "Luxembourgish","Macedonian","Malay","Malayalam","Maltese","Marathi","Mongolian","Nepali",
+  "Norwegian","Pashto","Persian (Farsi)","Polish","Portuguese","Punjabi","Romanian","Russian",
+  "Serbian","Sinhala","Slovak","Slovenian","Somali","Spanish","Swahili","Swedish","Tagalog",
+  "Tamil","Telugu","Thai","Turkish","Ukrainian","Urdu","Uzbek","Vietnamese","Welsh","Yoruba",
+  "Zulu",
+];
+const translateChk = $("translate"), translateLang = $("translate-lang"),
+      translateModifier = $("translate-modifier"), cleanupChk = $("cleanup"),
+      langList = $("lang-list");
+for (const l of TRANSLATE_LANGS) {
+  const opt = document.createElement("option");
+  opt.value = l;
+  langList.appendChild(opt);
+}
+cleanupChk.onchange = () => {
+  translateChk.disabled = !cleanupChk.checked;
+  if (!cleanupChk.checked) {
+    translateChk.checked = false;
+    translateLang.disabled = translateModifier.disabled = true;
+  }
+};
+translateChk.onchange = () => {
+  translateLang.disabled = translateModifier.disabled = !translateChk.checked;
+  if (translateChk.checked) translateLang.focus();
+};
+
 // --- audio selection ---
 function setAudio(blob, name) {
   audioBlob = blob; audioName = name;
@@ -335,7 +388,8 @@ function renderCleanup(cleanup, lang, durationS) {
   cleanedText.dir = lang === "ar" ? "rtl" : "auto";
   const nChanges = (cleanup.changes || []).length;
   cleanedMeta.textContent = `${nChanges} change${nChanges === 1 ? "" : "s"} applied` +
-    (cleanup.warnings && cleanup.warnings.length ? ` · ${cleanup.warnings.length} warning(s)` : "");
+    (cleanup.warnings && cleanup.warnings.length ? ` · ${cleanup.warnings.length} warning(s)` : "") +
+    (cleanup.translation ? ` · translated to ${cleanup.translation.target}` : "");
 
   copyBtn.onclick = async () => {
     await navigator.clipboard.writeText(cleanup.cleaned_text || "");
@@ -384,6 +438,15 @@ function hideStatus() { statusBox.style.display = "none"; }
 
 submitBtn.onclick = async () => {
   if (!audioBlob) return;
+  if (translateChk.checked) {
+    const val = translateLang.value.trim();
+    const match = TRANSLATE_LANGS.find((l) => l.toLowerCase() === val.toLowerCase());
+    if (!match) {
+      showStatus('Please select a target language from the list (start typing to narrow it).', true);
+      return;
+    }
+    translateLang.value = match;  // normalize to the list's spelling
+  }
   submitBtn.disabled = true;
   resultCard.style.display = "none";
   showStatus("Uploading " + audioName + " …");
@@ -396,7 +459,11 @@ submitBtn.onclick = async () => {
   form.append("punctuation", $("punctuation").checked);
   form.append("max_new_tokens", $("max-new-tokens").value);
   form.append("background", "true");
-  form.append("cleanup", $("cleanup").checked);
+  form.append("cleanup", cleanupChk.checked);
+  if (translateChk.checked) {
+    form.append("translate_lang", translateLang.value.trim());
+    form.append("translate_modifier", translateModifier.value.trim());
+  }
 
   const t0 = Date.now();
   try {

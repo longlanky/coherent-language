@@ -32,6 +32,8 @@ Long-form audio (>35 s) is chunked and reassembled automatically.
 | `max_new_tokens` | int | `256` | Generation cap |
 | `background` | bool | `false` | `true` → return `202` + `job_id` immediately instead of waiting |
 | `cleanup` | bool | `false` | `true` → LLM post-process the transcript (see *LLM post-cleanup*) |
+| `translate_lang` | string | — | with `cleanup=true`: translate the cleaned transcript into this language |
+| `translate_modifier` | string | — | optional modifier combined as "{modifier} {lang}", e.g. `Levantine` + `Arabic` (≤ 40 chars) |
 
 Response:
 
@@ -139,10 +141,18 @@ conservatively remove ASR artifacts while preserving every spoken word
 - The result gains a `cleanup` object: `cleaned_text`, `changes[]` (type,
   original, replacement, reason, confidence), `warnings[]`. On LLM failure the
   transcription still succeeds and `cleanup.error` is set instead.
+- **Optional translation**: set `translate_lang` (e.g. `French`) and optionally
+  `translate_modifier` (e.g. `Levantine`, combined as "Levantine Arabic") —
+  the core cleaning rules still run first, then the cleaned text is
+  translated; `cleaned_text` holds the translation and
+  `cleanup.translation.target` echoes the target. The web UI gates this
+  behind a checkbox with a type-to-narrow language autocomplete (~95 major
+  languages) and a 40-char-capped modifier box.
 - Web UI: "Clean up transcript with LLM" checkbox → second result card with
   the cleaned text, per-change highlighted deltas (badge + strikethrough →
   replacement + reason + confidence), warnings, Copy and Download buttons.
-- CLI: `./transcribe file.mp3 --cleanup` also saves `<name>.cleaned.txt`.
+- CLI: `./transcribe file.mp3 --cleanup` also saves `<name>.cleaned.txt`;
+  add `--translate French [--translate-modifier ...]` for translation.
 
 ## Client script (`./transcribe`)
 

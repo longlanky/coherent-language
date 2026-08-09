@@ -100,6 +100,10 @@ def main() -> int:
     p.add_argument("--no-punctuation", action="store_true")
     p.add_argument("--cleanup", action="store_true",
                    help="Post-process with the ollama LLM (gemma4:e2b); also saves <name>.cleaned.txt")
+    p.add_argument("--translate", metavar="LANG",
+                   help="Also translate the cleaned transcript into LANG (e.g. French)")
+    p.add_argument("--translate-modifier", metavar="TEXT",
+                   help="Optional modifier for the target, e.g. 'Levantine' with --translate Arabic")
     p.add_argument("--cookie", help="Cloudflare Access JWT (CF_Authorization)")
     p.add_argument("--output", help="Transcript output path (default: <audio>.<model>.txt)")
     args = p.parse_args()
@@ -118,7 +122,11 @@ def main() -> int:
               "the public endpoint may redirect to a login page.", file=sys.stderr)
 
     fields = {"background": "true", "punctuation": str(not args.no_punctuation).lower(),
-              "cleanup": str(args.cleanup).lower()}
+              "cleanup": str(bool(args.cleanup or args.translate)).lower()}
+    if args.translate:
+        fields["translate_lang"] = args.translate
+        if args.translate_modifier:
+            fields["translate_modifier"] = args.translate_modifier
     if args.model:
         fields["model"] = args.model
     if args.language:
@@ -165,8 +173,10 @@ def main() -> int:
             cleaned = cleanup.get("cleaned_text", "")
             cleaned_out = audio.with_suffix(".cleaned.txt")
             cleaned_out.write_text(cleaned + "\n")
+            target = cleanup.get("translation", {}).get("target")
             print(f"\n--- cleaned transcript ({len(cleanup.get('changes', []))} changes, "
-                  f"{len(cleanup.get('warnings', []))} warnings) ---\n")
+                  f"{len(cleanup.get('warnings', []))} warnings"
+                  f"{', translated to ' + target if target else ''}) ---\n")
             print(cleaned)
             print(f"\n--- saved to {cleaned_out} ---")
 
