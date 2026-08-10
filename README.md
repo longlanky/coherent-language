@@ -154,6 +154,31 @@ conservatively remove ASR artifacts while preserving every spoken word
 - CLI: `./transcribe file.mp3 --cleanup` also saves `<name>.cleaned.txt`;
   add `--translate French [--translate-modifier ...]` for translation.
 
+## Text to speech (Kokoro-82M)
+
+The cached [`hexgrad/Kokoro-82M`](https://huggingface.co/hexgrad/Kokoro-82M)
+model is integrated for TTS, standalone or combined with transcription. It
+runs on CPU (fast at 82M params; the GPU stays free for ASR).
+
+- `POST /v1/audio/speech` — form fields `text`, `voice` (default `af_heart`),
+  `speed` (0.5–2.0) → `audio/wav` (24 kHz).
+- `GET /v1/tts/voices` — all 54 cached voices with gender/language labels.
+- Combined: pass `speak_voice=<id>` (and optional `speak_speed`) to
+  `/v1/audio/transcriptions` — the result gains `tts.audio_wav_b64`, spoken
+  from the cleaned/translated text when cleanup ran, else the raw transcript.
+- Web UI: a "Text to speech" card (textarea, voice picker grouped by language,
+  speed slider, inline player + wav download) and **🔊 Speak** buttons on both
+  transcript cards.
+- CLI: `./transcribe file.mp3 --speak [voice]` saves `<name>.<voice>.wav`.
+
+**Language coverage**: Kokoro has voices for English (US/GB), Spanish, French,
+Hindi, Italian, Japanese, Mandarin, and Portuguese (BR) — **no Arabic**. Voice
+id prefix picks the language; the UI groups voices accordingly. Note the
+kokoro/misaki packages pin Python <3.13 and their English G2P needs spacy, so
+on this host they are installed with `--no-deps --ignore-requires-python` and
+`tts.py` routes **all** languages through misaki's espeak-based G2P (English
+homograph handling is slightly weaker than the spacy path as a result).
+
 ## Client script (`./transcribe`)
 
 Wraps the whole flow — file selection, upload, background polling (immune to
@@ -318,6 +343,7 @@ cohere-asr/
 ├── app.py             # FastAPI service (single file)
 ├── static/index.html  # web UI served at /
 ├── quant.py           # INT8 encoder quantization (Int8Linear)
+├── tts.py             # Kokoro-82M TTS (espeak G2P routing)
 ├── asr-server         # daemon manager (start/stop/status/logs)
 ├── transcribe         # CLI client (upload + poll + save)
 ├── comparison/        # benchmark scripts and transcripts

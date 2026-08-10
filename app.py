@@ -7,6 +7,7 @@ Serves the locally cached HuggingFace models:
 Run:  .venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000
 """
 
+import base64
 import gc
 import json
 import logging
@@ -398,6 +399,61 @@ def _translate_target(lang: str, modifier: str) -> str | None:
     return f"{modifier} {lang}".strip() if modifier else lang
 
 
+# --- Text to speech (Kokoro-82M) -------------------------------------------
+# Runs on CPU by design (fast at 82M params; keeps the GPU free for ASR).
+# tts.py is imported lazily so the ASR API still starts if kokoro breaks.
+
+_tts_lock = threading.Lock()
+
+_TTS_VOICE_LANGS = {
+    "a": "American English", "b": "British English", "e": "Spanish",
+    "f": "French", "h": "Hindi", "i": "Italian", "j": "Japanese",
+    "p": "Portuguese (BR)", "z": "Mandarin Chinese",
+}
+
+
+def _tts_synthesize(text: str, voice: str, speed: float) -> bytes:
+    import tts
+    with _tts_lock:
+        return tts.synthesize_wav_bytes(text, voice=voice, speed=speed)
+
+
+@app.get("/v1/tts/voices")
+def tts_voices():
+    import tts
+    voices = []
+    for v in tts.available_voices():
+        voices.append({
+            "id": v,
+            "gender": "female" if v[1] == "f" else "male",
+            "language": _TTS_VOICE_LANGS.get(v[0], v[0]),
+        })
+    return {"voices": voices, "sample_rate": tts.SAMPLE_RATE}
+
+
+@app.post("/v1/audio/speech")
+def create_speech(
+    text: str = Form(...),
+    voice: str = Form("af_heart"),
+    speed: float = Form(1.0),
+):
+    text = text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    if len(text) > 20000:
+        raise HTTPException(status_code=400, detail="text too long (20000 chars max)")
+    import tts
+    if voice not in tts.available_voices():
+        raise HTTPException(status_code=400,
+                            detail=f"Unknown voice '{voice}'. See /v1/tts/voices.")
+    try:
+        wav = _tts_synthesize(text, voice, speed)
+    except Exception as exc:
+        log.exception("TTS failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+    return Response(content=wav, media_type="audio/wav")
+
+
 # --- Background jobs -------------------------------------------------------
 # Long recordings exceed proxy timeouts (e.g. Cloudflare's 100 s), so clients
 # can submit with background=true and poll for the result. One worker thread;
@@ -408,10 +464,28 @@ _jobs: dict[str, dict] = {}
 _job_queue: queue.Queue = queue.Queue()
 
 
+def _maybe_speak(result: dict, speak_voice: str, speak_speed: float):
+    """Attach TTS audio of the final text (cleaned if cleanup ran, else raw)
+    as result["tts"]["audio_wav_b64"]. Enabled when speak_voice is non-empty."""
+    if not speak_voice:
+        return
+    text = result["text"]
+    cleanup = result.get("cleanup")
+    if cleanup and not cleanup.get("error") and cleanup.get("cleaned_text"):
+        text = cleanup["cleaned_text"]
+    try:
+        wav = _tts_synthesize(text, speak_voice, speak_speed)
+        result["tts"] = {"voice": speak_voice,
+                         "audio_wav_b64": base64.b64encode(wav).decode()}
+    except Exception as exc:
+        log.exception("TTS failed")
+        result["tts"] = {"error": str(exc)}
+
+
 def _job_worker():
     while True:
         (job_id, audio_path, model, language, punctuation, max_new_tokens,
-         cleanup, translate_to) = _job_queue.get()
+         cleanup, translate_to, speak_voice, speak_speed) = _job_queue.get()
         _jobs[job_id]["status"] = "running"
         with _model_lock:
             try:
@@ -431,6 +505,7 @@ def _job_worker():
                 # ASR model is out of VRAM now; gemma gets the GPU to itself.
                 result["cleanup"] = run_cleanup(result["text"], translate_to)
             if result is not None:
+                _maybe_speak(result, speak_voice, speak_speed)
                 _jobs[job_id].update(status="done", result=result)
 
 
@@ -456,6 +531,8 @@ def transcribe(
     cleanup: bool = Form(False),
     translate_lang: str = Form(""),
     translate_modifier: str = Form(""),
+    speak_voice: str = Form(""),
+    speak_speed: float = Form(1.0),
 ):
     if model not in MODELS:
         raise HTTPException(
@@ -470,7 +547,7 @@ def transcribe(
         job_id = uuid.uuid4().hex
         _jobs[job_id] = {"status": "queued", "model": model}
         _job_queue.put((job_id, audio_path, model, language, punctuation, max_new_tokens,
-                        cleanup, translate_to))
+                        cleanup, translate_to, speak_voice, speak_speed))
         return JSONResponse(status_code=202, content={"job_id": job_id, "status": "queued", "model": model})
 
     # The whole request lifecycle runs under one lock: two models are never
@@ -498,6 +575,8 @@ def transcribe(
         if status_code is None and cleanup:
             # ASR model is out of VRAM now; gemma gets the GPU to itself.
             result["cleanup"] = run_cleanup(result["text"], translate_to)
+        if status_code is None:
+            _maybe_speak(result, speak_voice, speak_speed)
 
     if status_code is None:
         return result

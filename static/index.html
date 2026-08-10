@@ -144,6 +144,28 @@
     cursor: pointer; background: var(--accent); color: #fff; border: none; font-size: 0.95rem;
   }
   #copy-btn:hover, #download-cleaned-btn:hover { background: var(--accent-hover); }
+  .speak-btn {
+    margin-top: 14px; padding: 9px 18px; border-radius: 8px; cursor: pointer;
+    background: var(--bg-inset); color: var(--text);
+    border: 1px solid var(--border); font-size: 0.95rem;
+  }
+  .speak-btn:hover { border-color: var(--accent); }
+  #tts-card textarea {
+    width: 100%; padding: 10px; border-radius: 8px; resize: vertical;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    font-size: 0.95rem; font-family: inherit;
+  }
+  .tts-row { display: flex; gap: 16px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+  .tts-row select { flex: 1; min-width: 220px; }
+  .speed-label { display: flex; align-items: center; gap: 8px; margin: 0; font-weight: 400;
+    color: var(--text-soft); font-size: 0.9rem; }
+  #tts-btn {
+    margin-top: 14px; padding: 9px 18px; border-radius: 8px; cursor: pointer;
+    background: var(--accent); color: #fff; border: none; font-size: 0.95rem;
+  }
+  #tts-btn:hover { background: var(--accent-hover); }
+  #tts-player { width: 100%; margin-top: 14px; }
+  #tts-download { display: inline-block; margin-top: 10px; color: var(--accent); font-size: 0.92rem; }
   footer { text-align: center; color: var(--text-soft); font-size: 0.8rem; padding: 24px; }
   footer a { color: var(--accent); }
 </style>
@@ -203,6 +225,7 @@
     <div id="result-text" dir="auto"></div>
     <div class="meta" id="result-meta"></div>
     <button id="download-btn">⬇️ Download .txt</button>
+    <button class="speak-btn" data-target="raw">🔊 Speak</button>
   </div>
 
   <div class="card" id="cleaned-card">
@@ -211,8 +234,22 @@
     <div class="meta" id="cleaned-meta"></div>
     <button id="copy-btn">📋 Copy text</button>
     <button id="download-cleaned-btn">⬇️ Download .txt</button>
+    <button class="speak-btn" data-target="cleaned">🔊 Speak</button>
     <div id="changes-list"></div>
     <div id="warnings-list"></div>
+  </div>
+
+  <div class="card" id="tts-card">
+    <label>Text to speech</label>
+    <textarea id="tts-text" rows="4" placeholder="Type or paste text here…"></textarea>
+    <div class="tts-row">
+      <select id="tts-voice"></select>
+      <label class="speed-label">speed <input type="range" id="tts-speed" min="0.5" max="2" step="0.1" value="1">
+        <span id="tts-speed-val">1.0×</span></label>
+    </div>
+    <button id="tts-btn">🔊 Generate speech</button>
+    <audio id="tts-player" controls style="display:none"></audio>
+    <a id="tts-download" style="display:none">⬇️ Download .wav</a>
   </div>
 </main>
 
@@ -428,7 +465,70 @@ function renderCleanup(cleanup, lang, durationS) {
   cleanedCard.style.display = "block";
 }
 
-// --- submit + poll ---
+// --- text to speech ---
+const ttsText = $("tts-text"), ttsVoice = $("tts-voice"), ttsSpeed = $("tts-speed"),
+      ttsSpeedVal = $("tts-speed-val"), ttsBtn = $("tts-btn"),
+      ttsPlayer = $("tts-player"), ttsDownload = $("tts-download");
+
+ttsSpeed.oninput = () => { ttsSpeedVal.textContent = Number(ttsSpeed.value).toFixed(1) + "×"; };
+
+fetch("/v1/tts/voices").then((r) => r.json()).then((data) => {
+  const groups = {};
+  for (const v of data.voices) {
+    (groups[v.language] ||= []).push(v);
+  }
+  for (const [lang, voices] of Object.entries(groups)) {
+    const g = document.createElement("optgroup");
+    g.label = lang;
+    for (const v of voices) {
+      const opt = document.createElement("option");
+      opt.value = v.id;
+      opt.textContent = `${v.id} (${v.gender})`;
+      if (v.id === "af_heart") opt.selected = true;
+      g.appendChild(opt);
+    }
+    ttsVoice.appendChild(g);
+  }
+}).catch(() => {
+  const opt = document.createElement("option");
+  opt.value = "af_heart"; opt.textContent = "af_heart (female)";
+  ttsVoice.appendChild(opt);
+});
+
+async function speakText(text) {
+  if (!text.trim()) { showStatus("Nothing to speak — the text is empty.", true); return; }
+  showStatus("Generating speech…");
+  const form = new FormData();
+  form.append("text", text);
+  form.append("voice", ttsVoice.value);
+  form.append("speed", ttsSpeed.value);
+  try {
+    const resp = await fetch("/v1/audio/speech", { method: "POST", body: form });
+    if (!resp.ok) throw new Error((await resp.text()).slice(0, 300));
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    ttsPlayer.src = url;
+    ttsPlayer.style.display = "block";
+    ttsDownload.href = url;
+    ttsDownload.download = `tts-${ttsVoice.value}.wav`;
+    ttsDownload.style.display = "inline-block";
+    hideStatus();
+    ttsPlayer.scrollIntoView({ behavior: "smooth" });
+    ttsPlayer.play().catch(() => {});  // autoplay may need a user gesture
+  } catch (err) {
+    showStatus("TTS error: " + err.message, true);
+  }
+}
+
+ttsBtn.onclick = () => speakText(ttsText.value);
+document.querySelectorAll(".speak-btn").forEach((btn) => {
+  btn.onclick = () => {
+    const src = btn.dataset.target === "cleaned" ? cleanedText.textContent : resultText.textContent;
+    ttsText.value = src;  // keep the TTS card in sync for tweaking
+    speakText(src);
+  };
+});
+
 function showStatus(msg, isError) {
   statusBox.textContent = msg;
   statusBox.className = isError ? "error" : "";

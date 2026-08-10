@@ -8,3 +8,25 @@ uvicorn[standard]
 python-multipart
 soundfile
 librosa
+requests
+# Kokoro TTS. On Python 3.14 install with:
+#   pip install --no-deps --ignore-requires-python kokoro==0.7.16 misaki==0.7.16
+# (both declare <3.13; misaki's spacy-based English G2P is bypassed — tts.py
+# routes everything through its espeak G2P)
+kokoro==0.7.16
+misaki==0.7.16
+phonemizer-fork
+espeakng_loader
+num2words
+loguru
+regex
+# misaki[ja]/[zh] G2P deps (Japanese + Mandarin voices)
+fugashi
+unidic-lite
+jaconv
+mojimoji
+cn2an
+jieba
+pypinyin
+ordered-set
+

@@ -104,6 +104,10 @@ def main() -> int:
                    help="Also translate the cleaned transcript into LANG (e.g. French)")
     p.add_argument("--translate-modifier", metavar="TEXT",
                    help="Optional modifier for the target, e.g. 'Levantine' with --translate Arabic")
+    p.add_argument("--speak", nargs="?", const="af_heart", default="", metavar="VOICE",
+                   help="Also synthesize the (cleaned) transcript with Kokoro TTS; "
+                        "optional voice id (default af_heart, see /v1/tts/voices). "
+                        "Saves <name>.<voice>.wav")
     p.add_argument("--cookie", help="Cloudflare Access JWT (CF_Authorization)")
     p.add_argument("--output", help="Transcript output path (default: <audio>.<model>.txt)")
     args = p.parse_args()
@@ -127,6 +131,8 @@ def main() -> int:
         fields["translate_lang"] = args.translate
         if args.translate_modifier:
             fields["translate_modifier"] = args.translate_modifier
+    if args.speak:
+        fields["speak_voice"] = args.speak
     if args.model:
         fields["model"] = args.model
     if args.language:
@@ -179,6 +185,17 @@ def main() -> int:
                   f"{', translated to ' + target if target else ''}) ---\n")
             print(cleaned)
             print(f"\n--- saved to {cleaned_out} ---")
+
+    tts_result = result.get("tts")
+    if tts_result:
+        if tts_result.get("error"):
+            print(f"\n--- TTS failed: {tts_result['error']} ---")
+        else:
+            import base64
+            voice = tts_result.get("voice", "tts")
+            wav_out = audio.with_suffix(f".{voice}.wav")
+            wav_out.write_bytes(base64.b64decode(tts_result["audio_wav_b64"]))
+            print(f"\n--- speech saved to {wav_out} ---")
 
 
 if __name__ == "__main__":
