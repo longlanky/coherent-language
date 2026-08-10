@@ -122,7 +122,8 @@ def _ollama_chat(messages: list[dict]) -> str:
     resp = requests.post(
         f"{OLLAMA_HOST}/api/chat",
         json={"model": OLLAMA_MODEL, "messages": messages,
-              "stream": False, "format": "json"},
+              "stream": False, "format": "json",
+              "options": {"num_predict": -1}},  # never truncate mid-JSON
         timeout=900,  # long transcripts on a shared 4 GB GPU can take minutes
     )
     resp.raise_for_status()
@@ -130,14 +131,32 @@ def _ollama_chat(messages: list[dict]) -> str:
 
 
 def _parse_json(content: str) -> dict:
-    try:
-        data = json.loads(content)
-    except json.JSONDecodeError:
-        # Tolerate stray markdown fences despite format:"json".
-        data = json.loads(content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip())
+    # Tolerate stray markdown fences despite format:"json", raw control
+    # characters inside strings (strict=False), and any leading/trailing
+    # prose around the JSON object.
+    cleaned = content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start != -1 and end > start:
+        cleaned = cleaned[start:end + 1]
+    data = json.loads(cleaned, strict=False)
     if not isinstance(data, dict):
         raise ValueError(f"unexpected payload: {content[:200]}")
     return data
+
+
+def _ollama_chat_json(messages: list[dict], attempts: int = 3) -> dict:
+    """_ollama_chat + _parse_json with retries: the model intermittently
+    emits malformed JSON (observed ~1 in 5 longer runs)."""
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        content = _ollama_chat(messages)
+        try:
+            return _parse_json(content)
+        except (json.JSONDecodeError, ValueError) as exc:
+            last_exc = exc
+            log.warning("LLM returned invalid JSON (attempt %d/%d): %s", attempt, attempts, exc)
+            log.warning("raw LLM content (first 500 chars): %s", content[:500])
+    raise last_exc
 
 
 def run_cleanup(raw_text: str, translate_to: str | None = None) -> dict:
@@ -154,11 +173,10 @@ def run_cleanup(raw_text: str, translate_to: str | None = None) -> dict:
     log.info("Running LLM cleanup with %s (%d chars, translate_to=%s)",
              OLLAMA_MODEL, len(raw_text), translate_to)
     try:
-        content = _ollama_chat([
+        data = _ollama_chat_json([
             {"role": "system", "content": _CLEANUP_SYSTEM_PROMPT},
             {"role": "user", "content": _CLEANUP_USER_TEMPLATE.replace("{raw_transcript}", raw_text)},
         ])
-        data = _parse_json(content)
         if "cleaned_text" not in data:
             raise ValueError(f"unexpected cleanup payload: {str(data)[:200]}")
         data.setdefault("changes", [])
@@ -166,7 +184,7 @@ def run_cleanup(raw_text: str, translate_to: str | None = None) -> dict:
 
         if translate_to:
             log.info("Translating cleaned text to %s", translate_to)
-            tr_content = _ollama_chat([
+            tr_data = _ollama_chat_json([
                 {"role": "system", "content": (
                     "You are a professional translator. Translate the user's text "
                     f"into {translate_to}. Translate faithfully and completely — do "
@@ -175,10 +193,9 @@ def run_cleanup(raw_text: str, translate_to: str | None = None) -> dict:
                     '{"translation": "..."}.')},
                 {"role": "user", "content": data["cleaned_text"]},
             ])
-            tr_data = _parse_json(tr_content)
             translated = tr_data.get("translation") or tr_data.get("cleaned_text")
             if not translated:
-                raise ValueError(f"unexpected translation payload: {tr_content[:200]}")
+                raise ValueError(f"unexpected translation payload: {str(tr_data)[:200]}")
             data["cleaned_text"] = translated
             data["translation"] = {"target": translate_to}
 
