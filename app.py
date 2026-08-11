@@ -413,22 +413,35 @@ _TTS_VOICE_LANGS = {
 
 
 def _tts_synthesize(text: str, voice: str, speed: float) -> bytes:
-    import tts
     with _tts_lock:
+        if voice.startswith("silma_"):
+            import tts_silma
+            return tts_silma.synthesize_wav_bytes(text, voice=voice, speed=speed)
+        import tts
         return tts.synthesize_wav_bytes(text, voice=voice, speed=speed)
+
+
+def _all_voices() -> list[dict]:
+    """Kokoro voices plus SILMA voice-clone references (silma_*)."""
+    import tts
+    voices = [
+        {"id": v, "engine": "kokoro",
+         "gender": "female" if v[1] == "f" else "male",
+         "language": _TTS_VOICE_LANGS.get(v[0], v[0])}
+        for v in tts.available_voices()
+    ]
+    import tts_silma
+    for v in tts_silma.available_voices():
+        lang = "Arabic + English (voice clone)"
+        voices.append({"id": v, "engine": "silma", "gender": "clone",
+                       "language": lang})
+    return voices
 
 
 @app.get("/v1/tts/voices")
 def tts_voices():
     import tts
-    voices = []
-    for v in tts.available_voices():
-        voices.append({
-            "id": v,
-            "gender": "female" if v[1] == "f" else "male",
-            "language": _TTS_VOICE_LANGS.get(v[0], v[0]),
-        })
-    return {"voices": voices, "sample_rate": tts.SAMPLE_RATE}
+    return {"voices": _all_voices(), "sample_rate": tts.SAMPLE_RATE}
 
 
 @app.post("/v1/audio/speech")
@@ -442,8 +455,8 @@ def create_speech(
         raise HTTPException(status_code=400, detail="text is required")
     if len(text) > 20000:
         raise HTTPException(status_code=400, detail="text too long (20000 chars max)")
-    import tts
-    if voice not in tts.available_voices():
+    known = {v["id"] for v in _all_voices()}
+    if voice not in known:
         raise HTTPException(status_code=400,
                             detail=f"Unknown voice '{voice}'. See /v1/tts/voices.")
     try:

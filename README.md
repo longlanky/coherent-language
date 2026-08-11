@@ -179,6 +179,25 @@ on this host they are installed with `--no-deps --ignore-requires-python` and
 `tts.py` routes **all** languages through misaki's espeak-based G2P (English
 homograph handling is slightly weaker than the spacy path as a result).
 
+### SILMA TTS (Arabic + English, voice cloning)
+
+[`silma-ai/silma-tts`](https://huggingface.co/silma-ai/silma-tts) (F5-TTS
+based, 150M) covers **Arabic and English** — filling Kokoro's Arabic gap. It
+clones voices from short reference clips instead of named voices: entries in
+`voices/` (`<id>.wav` + `<id>.txt` transcript) appear as `silma_*` voices in
+`/v1/tts/voices` and the UI picker (group "Arabic + English (voice clone)").
+Currently bundled: `silma_ar_1`, `silma_ar_2` (Arabic), `silma_en_1` (English).
+Add your own by dropping a clean 3–10 s reference wav + exact transcript into
+`voices/` (mind the model's voice-consent license terms). SILMA runs on CPU
+(`SILMA_TTS_DEVICE` to override), auto-applies Arabic tashkeel via CATT, and
+is usable exactly like a Kokoro voice — standalone `/v1/audio/speech` calls or
+`speak_voice=silma_*` on transcriptions.
+
+Host shims (see `tts_silma.py`): NeMo text normalizer is stubbed pass-through
+(pynini won't build on py3.14 — numbers/dates aren't normalized), and
+`torchaudio.load` is replaced with a soundfile reader (torchcodec's native
+lib won't load here).
+
 ## Client script (`./transcribe`)
 
 Wraps the whole flow — file selection, upload, background polling (immune to
@@ -344,6 +363,8 @@ cohere-asr/
 ├── static/index.html  # web UI served at /
 ├── quant.py           # INT8 encoder quantization (Int8Linear)
 ├── tts.py             # Kokoro-82M TTS (espeak G2P routing)
+├── tts_silma.py       # SILMA TTS (Arabic/English voice cloning)
+├── voices/            # SILMA reference clips (<id>.wav + <id>.txt)
 ├── asr-server         # daemon manager (start/stop/status/logs)
 ├── transcribe         # CLI client (upload + poll + save)
 ├── comparison/        # benchmark scripts and transcripts

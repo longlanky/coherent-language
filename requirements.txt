@@ -29,4 +29,21 @@ cn2an
 jieba
 pypinyin
 ordered-set
+# SILMA TTS (Arabic/English voice cloning). Install with:
+#   pip install --no-deps silma-tts
+# (its nemo_text_processing dep needs pynini, unbuildable on py3.14 — tts_silma.py
+# stubs it with a pass-through normalizer; torchaudio.load is shimmed via
+# soundfile; install torchaudio from the pytorch cpu index)
+silma-tts
+catt-tashkeel
+cached_path
+hydra-core
+omegaconf
+pydub
+torchdiffeq
+vocos
+x_transformers
+torchaudio
+matplotlib
+unidecode
 

@@ -483,7 +483,7 @@ fetch("/v1/tts/voices").then((r) => r.json()).then((data) => {
     for (const v of voices) {
       const opt = document.createElement("option");
       opt.value = v.id;
-      opt.textContent = `${v.id} (${v.gender})`;
+      opt.textContent = v.engine === "silma" ? `${v.id} (cloned voice)` : `${v.id} (${v.gender})`;
       if (v.id === "af_heart") opt.selected = true;
       g.appendChild(opt);
     }
