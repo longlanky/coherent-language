@@ -10,11 +10,14 @@ models from HuggingFace:
 | `cohere-transcribe-arabic-07-2026` | `CohereLabs/cohere-transcribe-arabic-07-2026` | — (FP16) | ar, en (incl. Arabic–English code-switching) |
 | `cohere-transcribe-03-2026-int8enc` | `CohereLabs/cohere-transcribe-03-2026` | INT8 encoder / FP16 decoder | same as base |
 | `cohere-transcribe-arabic-07-2026-int8enc` | `CohereLabs/cohere-transcribe-arabic-07-2026` | INT8 encoder / FP16 decoder | same as base |
+| `ivrit-whisper-large-v3-turbo-ct2` | `ivrit-ai/whisper-large-v3-turbo-ct2` | INT8 via ctranslate2 | he (tuned), en, other Whisper languages |
 
-All are 2B-parameter Conformer encoder-decoder models, served via
-`transformers>=5.4.0` (`AutoProcessor` + `CohereAsrForConditionalGeneration`).
-Weights are loaded from the local HuggingFace cache (`~/.cache/huggingface/hub/`)
-— no downloads required. No authentication.
+The Cohere entries are 2B-parameter Conformer encoder-decoder models, served
+via `transformers>=5.4.0` (`AutoProcessor` + `CohereAsrForConditionalGeneration`).
+The ivrit entry is a Whisper large-v3-turbo fine-tune for Hebrew in CTranslate2
+format, served via a second backend, `faster-whisper`. Weights are loaded from
+the local HuggingFace cache (`~/.cache/huggingface/hub/`) — no downloads
+required. No authentication.
 
 ## Endpoints
 
@@ -47,6 +50,11 @@ Response:
 ```
 
 Errors: `400` for unknown model, unsupported language, or undecodable audio; `500` for inference failures.
+
+Backend notes: `punctuation` and `max_new_tokens` only apply to the Cohere
+models — the faster-whisper backend (`ivrit-whisper-large-v3-turbo-ct2`)
+ignores them (Whisper always punctuates, and long-audio windowing is handled
+internally instead of the `ASR_CHUNK_BATCH` mini-batch loop).
 
 **Long recordings and proxy timeouts (Cloudflare's 100 s):** synchronous
 requests only work for audio short enough to finish within the proxy limit.
@@ -246,6 +254,7 @@ cd /home/nolan/cohere-asr
 | `--dtype …` | `ASR_DTYPE` | fp16 (GPU) / fp32 (CPU) | Model dtype |
 | `--default-model ID` | `ASR_DEFAULT_MODEL` | `cohere-transcribe-03-2026` | Model when requests omit `model` — set an `-int8enc` id for quantized-by-default |
 | `--chunk-batch N` | `ASR_CHUNK_BATCH` | `4` | Long-audio chunks per generate mini-batch (lower if OOM) |
+| — | `ASR_WHISPER_COMPUTE` | `int8` | ctranslate2 compute type for the faster-whisper backend (export before `start`; `int8_float16` needs CC ≥ 7.0 — not on the P1000) |
 | `--host` / `--port` | — | `0.0.0.0` / `8000` | Bind address |
 
 Plain `uvicorn app:app --host 0.0.0.0 --port 8000` still works for

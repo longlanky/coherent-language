@@ -3,6 +3,7 @@
 Serves the locally cached HuggingFace models:
   - CohereLabs/cohere-transcribe-03-2026        (14 languages)
   - CohereLabs/cohere-transcribe-arabic-07-2026 (Arabic + English)
+  - ivrit-ai/whisper-large-v3-turbo-ct2         (Hebrew; faster-whisper backend)
 
 Run:  .venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000
 """
@@ -45,11 +46,13 @@ MODELS = {
         "repo_id": "CohereLabs/cohere-transcribe-03-2026",
         "default_language": "en",
         "quantize_encoder": False,
+        "backend": "cohere",
     },
     "cohere-transcribe-arabic-07-2026": {
         "repo_id": "CohereLabs/cohere-transcribe-arabic-07-2026",
         "default_language": "ar",
         "quantize_encoder": False,
+        "backend": "cohere",
     },
     # INT8-encoder / FP16-decoder hybrids (FluidInference CoreML q8 scheme,
     # reproduced natively in PyTorch — CoreML itself can't run on Linux).
@@ -57,11 +60,21 @@ MODELS = {
         "repo_id": "CohereLabs/cohere-transcribe-03-2026",
         "default_language": "en",
         "quantize_encoder": True,
+        "backend": "cohere",
     },
     "cohere-transcribe-arabic-07-2026-int8enc": {
         "repo_id": "CohereLabs/cohere-transcribe-arabic-07-2026",
         "default_language": "ar",
         "quantize_encoder": True,
+        "backend": "cohere",
+    },
+    # Hebrew ASR: ivrit.ai's whisper-large-v3-turbo fine-tune in CTranslate2
+    # format, run via faster-whisper (a separate runtime from the Cohere stack).
+    "ivrit-whisper-large-v3-turbo-ct2": {
+        "repo_id": "ivrit-ai/whisper-large-v3-turbo-ct2",
+        "default_language": "he",
+        "quantize_encoder": False,
+        "backend": "faster-whisper",
     },
 }
 
@@ -73,6 +86,11 @@ _dtype = {
     "bfloat16": torch.bfloat16,
     "float32": torch.float32,
 }[os.environ.get("ASR_DTYPE") or ("float16" if _device == "cuda" else "float32")]
+
+# ctranslate2 compute type for the faster-whisper backend. int8 (DP4A, needs
+# CC >= 6.1) is the fast path on the P1000 — int8_float16 requires CC >= 7.0
+# and is rejected on sm_61. ~0.8 GB VRAM for the 809M-param turbo.
+_whisper_compute = os.environ.get("ASR_WHISPER_COMPUTE") or "int8"
 
 # Default model id when a request omits `model` (e.g. an -int8enc variant to
 # make quantized inference the default). Override with ASR_DEFAULT_MODEL.
@@ -229,6 +247,17 @@ def get_model(name: str):
     _free_vram()
 
     repo_id = MODELS[name]["repo_id"]
+    if MODELS[name]["backend"] == "faster-whisper":
+        from faster_whisper import WhisperModel
+
+        log.info("Loading %s on %s (ctranslate2 %s) ...", repo_id, _device,
+                 _whisper_compute)
+        model = WhisperModel(repo_id, device=_device,
+                             compute_type=_whisper_compute)
+        _loaded[name] = (None, model)
+        log.info("Loaded %s", repo_id)
+        return _loaded[name]
+
     log.info("Loading %s on %s (%s) ...", repo_id, _device, _dtype)
     processor = AutoProcessor.from_pretrained(repo_id)
     if MODELS[name]["quantize_encoder"]:
@@ -281,6 +310,7 @@ def list_models():
             {
                 "id": name,
                 "repo_id": info["repo_id"],
+                "backend": info["backend"],
                 "default_language": info["default_language"],
                 "quantization": "int8-encoder/fp16-decoder" if info["quantize_encoder"] else None,
                 "loaded": name in _loaded,
@@ -298,6 +328,24 @@ def _transcribe(audio_path: str, model: str, language: str | None,
     processor, asr_model = get_model(model)
 
     lang = language or MODELS[model]["default_language"]
+
+    if MODELS[model]["backend"] == "faster-whisper":
+        # faster-whisper decodes the audio itself (PyAV handles webm/opus/mp3
+        # natively) and windows long files internally, so the load_audio
+        # fallback and mini-batch loop below don't apply. `punctuation` and
+        # `max_new_tokens` are Cohere-only and ignored here.
+        segments, info = asr_model.transcribe(audio_path, language=lang,
+                                              beam_size=5)
+        text = " ".join(s.text for s in segments).strip()
+        log.info("Transcribed %.1fs of audio with %s (%s)",
+                 info.duration, model, lang)
+        return {
+            "text": text,
+            "model": model,
+            "language": lang,
+            "duration_s": round(info.duration, 2),
+        }
+
     languages = getattr(asr_model.config, "supported_languages", None) or []
     if languages and lang not in languages:
         raise HTTPException(

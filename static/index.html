@@ -263,11 +263,16 @@ const MODELS = [
   { id: "cohere-transcribe-arabic-07-2026",         label: "Arabic (full precision)",    family: "arabic" },
   { id: "cohere-transcribe-03-2026-int8enc",        label: "Multilingual (recommended, fast)", family: "general" },
   { id: "cohere-transcribe-03-2026",                label: "Multilingual (full precision)",    family: "general" },
+  { id: "ivrit-whisper-large-v3-turbo-ct2",         label: "Hebrew (ivrit.ai)",                family: "hebrew" },
 ];
 const LANGS = {
   arabic: [
     ["ar", "ar - Arabic"],
     ["ar+en", "ar+en - Arabic / English (mixed, code-switched)"],
+    ["en", "en - English"],
+  ],
+  hebrew: [
+    ["he", "he - Hebrew"],
     ["en", "en - English"],
   ],
   general: [

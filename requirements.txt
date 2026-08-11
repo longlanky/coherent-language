@@ -46,4 +46,8 @@ x_transformers
 torchaudio
 matplotlib
 unidecode
+# Hebrew ASR backend (ivrit-ai/whisper-large-v3-turbo-ct2, CTranslate2 format).
+# Plain install works on Python 3.14 (cp314 wheels exist for ctranslate2, av,
+# onnxruntime).
+faster-whisper==1.2.1
 
