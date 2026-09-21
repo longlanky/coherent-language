@@ -10,13 +10,16 @@ Run:  .venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000
 
 import base64
 import gc
+import hashlib
 import json
 import logging
 import os
 import queue
+import re
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 
 import requests
@@ -30,6 +33,24 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("cohere-asr")
 
 SAMPLE_RATE = 16000
+
+# --- Request and job limits -------------------------------------------------
+# Uploads are streamed to disk and rejected with 413 past the cap (/tmp is
+# tmpfs on this host, so an oversized upload costs RAM, not disk).
+MAX_UPLOAD_MB = int(os.environ.get("ASR_MAX_UPLOAD_MB", "200"))
+MAX_AUDIO_SECONDS = float(os.environ.get("ASR_MAX_AUDIO_SECONDS", "7200"))
+# Backpressure for the background path: one worker, so a deep queue means
+# everything behind it waits. Reject early instead of queueing forever.
+MAX_QUEUED_JOBS = int(os.environ.get("ASR_MAX_QUEUED_JOBS", "32"))
+# Finished/failed jobs are dropped after this long (they hold transcripts and
+# any TTS audio), so memory cannot grow without bound.
+JOB_TTL_S = int(os.environ.get("ASR_JOB_TTL_S", "3600"))
+# Wall-clock budget for one LLM cleanup call.
+OLLAMA_TIMEOUT = int(os.environ.get("ASR_OLLAMA_TIMEOUT", "600"))
+# Model weights come from the local HF cache; never fetch during a request.
+LOCAL_FILES_ONLY = os.environ.get("ASR_LOCAL_FILES_ONLY", "1") not in ("0", "false", "")
+# Optional integrity pin: {"model-id": "revision-sha", ...} as JSON.
+_MODEL_REVISIONS = json.loads(os.environ.get("ASR_MODEL_REVISIONS", "{}") or "{}")
 
 # Optional LLM post-cleanup via a local ollama instance. The prompts live in
 # repo files next to this module.
@@ -143,7 +164,7 @@ def _ollama_chat(messages: list[dict]) -> str:
         json={"model": OLLAMA_MODEL, "messages": messages,
               "stream": False, "format": "json",
               "options": {"num_predict": -1}},  # never truncate mid-JSON
-        timeout=900,  # long transcripts on a shared 4 GB GPU can take minutes
+        timeout=OLLAMA_TIMEOUT,  # long transcripts on a shared 4 GB GPU take minutes
     )
     resp.raise_for_status()
     return resp.json()["message"]["content"]
@@ -174,7 +195,10 @@ def _ollama_chat_json(messages: list[dict], attempts: int = 3) -> dict:
         except (json.JSONDecodeError, ValueError) as exc:
             last_exc = exc
             log.warning("LLM returned invalid JSON (attempt %d/%d): %s", attempt, attempts, exc)
-            log.warning("raw LLM content (first 500 chars): %s", content[:500])
+            # Never log the payload: it is transcript content (personal data).
+            # Length + hash are enough to correlate repeat failures.
+            log.warning("invalid LLM payload: len=%d sha256=%s", len(content),
+                        hashlib.sha256(content.encode()).hexdigest()[:16])
     raise last_exc
 
 
@@ -247,37 +271,43 @@ def get_model(name: str):
     _free_vram()
 
     repo_id = MODELS[name]["repo_id"]
+    # Pin to a commit when ASR_MODEL_REVISIONS names one, and never hit the
+    # network mid-request: a cache miss must fail loudly, not silently download.
+    revision = _MODEL_REVISIONS.get(name)
+    offline = dict(revision=revision, local_files_only=LOCAL_FILES_ONLY)
+
     if MODELS[name]["backend"] == "faster-whisper":
         from faster_whisper import WhisperModel
 
-        log.info("Loading %s on %s (ctranslate2 %s) ...", repo_id, _device,
-                 _whisper_compute)
+        log.info("Loading %s on %s (ctranslate2 %s, revision %s) ...", repo_id,
+                 _device, _whisper_compute, revision or "latest cached")
         model = WhisperModel(repo_id, device=_device,
-                             compute_type=_whisper_compute)
+                             compute_type=_whisper_compute, **offline)
         _loaded[name] = (None, model)
         log.info("Loaded %s", repo_id)
         return _loaded[name]
 
-    log.info("Loading %s on %s (%s) ...", repo_id, _device, _dtype)
-    processor = AutoProcessor.from_pretrained(repo_id)
+    log.info("Loading %s on %s (%s, revision %s) ...", repo_id, _device, _dtype,
+             revision or "latest cached")
+    processor = AutoProcessor.from_pretrained(repo_id, **offline)
     if MODELS[name]["quantize_encoder"]:
         from quant import quantize_encoder_int8
 
         # Load on CPU and quantize there first: the fp16 model fills
         # the 4 GB GPU, leaving no room for quantization temporaries.
         model = CohereAsrForConditionalGeneration.from_pretrained(
-            repo_id, torch_dtype=_dtype
+            repo_id, torch_dtype=_dtype, **offline
         )
         with torch.no_grad():
             quantize_encoder_int8(model)
         model = model.to(_device)
     elif _device == "cuda":
         model = CohereAsrForConditionalGeneration.from_pretrained(
-            repo_id, torch_dtype=_dtype, device_map="auto"
+            repo_id, torch_dtype=_dtype, device_map="auto", **offline
         )
     else:
         model = CohereAsrForConditionalGeneration.from_pretrained(
-            repo_id, torch_dtype=_dtype
+            repo_id, torch_dtype=_dtype, **offline
         ).to(_device)
     model.eval()
     _loaded[name] = (processor, model)
@@ -298,7 +328,21 @@ def favicon():
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    """Liveness plus subsystem health.
+
+    A dead worker thread or a queue that has not drained used to report "ok"
+    while every job hung in "queued" forever, so liveness alone was useless.
+    """
+    queue_depth = _job_queue.qsize()
+    worker_alive = (time.time() - _worker_heartbeat) < 300
+    stale = queue_depth > 0 and (time.time() - _last_job_completed) > 1800
+    return {
+        "status": "degraded" if (stale or not worker_alive) else "ok",
+        "queue_depth": queue_depth,
+        "jobs": len(_jobs),
+        "worker_alive": worker_alive,
+        "seconds_since_last_job": round(time.time() - _last_job_completed, 1),
+    }
 
 
 @app.get("/v1/models")
@@ -306,6 +350,7 @@ def list_models():
     return {
         "device": _device,
         "dtype": str(_dtype),
+        "local_files_only": LOCAL_FILES_ONLY,
         "models": [
             {
                 "id": name,
@@ -313,6 +358,7 @@ def list_models():
                 "backend": info["backend"],
                 "default_language": info["default_language"],
                 "quantization": "int8-encoder/fp16-decoder" if info["quantize_encoder"] else None,
+                "revision": _MODEL_REVISIONS.get(name),
                 "loaded": name in _loaded,
             }
             for name, info in MODELS.items()
@@ -321,7 +367,8 @@ def list_models():
 
 
 def _transcribe(audio_path: str, model: str, language: str | None,
-                punctuation: bool, max_new_tokens: int) -> dict:
+                punctuation: bool, max_new_tokens: int,
+                chunk_batch: int | None = None) -> dict:
     """Run one transcription on a local audio file. Holds all model/tensor
     references in this frame, so they are released when it returns — the
     caller can then free the VRAM."""
@@ -355,25 +402,35 @@ def _transcribe(audio_path: str, model: str, language: str | None,
 
     try:
         audio = load_audio(audio_path, sampling_rate=SAMPLE_RATE)
-    except Exception as first_exc:
+    except Exception:
         # Some containers (e.g. webm/opus from browser MediaRecorder) aren't
         # decodable by librosa — convert to 16 kHz mono wav with ffmpeg and retry.
-        wav_path = audio_path + ".ffmpeg.wav"
+        # The intermediate path is unpredictable (it used to be a fixed sibling
+        # name), and ffmpeg is restricted to local files since these bytes came
+        # from the network.
+        fd, wav_path = tempfile.mkstemp(prefix="asr-", suffix=".ffmpeg.wav")
+        os.close(fd)
         try:
             subprocess.run(
-                ["ffmpeg", "-y", "-v", "error", "-i", audio_path,
-                 "-ar", str(SAMPLE_RATE), "-ac", "1", wav_path],
+                ["ffmpeg", "-nostdin", "-protocol_whitelist", "file",
+                 "-y", "-v", "error", "-i", audio_path,
+                 "-ar", str(SAMPLE_RATE), "-ac", "1",
+                 "-t", str(MAX_AUDIO_SECONDS), wav_path],
                 check=True, capture_output=True, timeout=300,
             )
             audio = load_audio(wav_path, sampling_rate=SAMPLE_RATE)
         except Exception:
-            raise HTTPException(status_code=400,
-                                detail=f"Could not decode audio: {first_exc}")
+            raise HTTPException(status_code=400, detail="Could not decode audio")
         finally:
             if os.path.exists(wav_path):
                 os.unlink(wav_path)
 
     duration_s = len(audio) / SAMPLE_RATE
+    if duration_s > MAX_AUDIO_SECONDS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"audio too long ({duration_s:.0f}s; limit {MAX_AUDIO_SECONDS:.0f}s)",
+        )
     inputs = processor(
         audio,
         sampling_rate=SAMPLE_RATE,
@@ -388,7 +445,7 @@ def _transcribe(audio_path: str, model: str, language: str | None,
     # on all chunks as one batch needs VRAM proportional to the chunk count
     # (a 24 min file = 42 chunks > 2.3 GiB of activations — fatal on a 4 GB
     # card), so generate in mini-batches and concatenate.
-    chunk_batch = int(os.environ.get("ASR_CHUNK_BATCH", "4"))
+    chunk_batch = chunk_batch or int(os.environ.get("ASR_CHUNK_BATCH", "4"))
     n_chunks = inputs["input_features"].shape[0]
     if n_chunks <= chunk_batch:
         outputs = asr_model.generate(**inputs, max_new_tokens=max_new_tokens)
@@ -432,18 +489,91 @@ def _transcribe(audio_path: str, model: str, language: str | None,
 
 
 def _save_upload(file: UploadFile) -> str:
-    suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
+    """Stream the upload to a temp file, rejecting it at MAX_UPLOAD_MB.
+
+    The previous version read the whole body into memory first; /tmp is tmpfs
+    here, so an oversized upload cost RAM rather than disk.
+    """
+    # basename() first: only the extension is wanted, never a path component.
+    suffix = os.path.splitext(os.path.basename(file.filename or "audio.wav"))[1] or ".wav"
+    max_bytes = MAX_UPLOAD_MB * 2**20
+    written = 0
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(file.file.read())
+        try:
+            while True:
+                chunk = file.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"upload exceeds {MAX_UPLOAD_MB} MiB",
+                    )
+                tmp.write(chunk)
+        except Exception:
+            tmp.close()
+            if os.path.exists(tmp.name):
+                os.unlink(tmp.name)
+            raise
         return tmp.name
+
+
+# Allowlisted translation targets — the same list the web UI offers. The target
+# is interpolated into an LLM system prompt, and the transcript is untrusted
+# text, so anything outside this set (including injection payloads such as
+# "French. Ignore prior rules and…") is rejected rather than forwarded.
+TRANSLATE_TARGETS = frozenset([
+    "Afrikaans", "Albanian", "Amharic", "Arabic", "Armenian", "Azerbaijani",
+    "Basque", "Belarusian", "Bengali", "Bosnian", "Bulgarian", "Burmese",
+    "Catalan", "Cebuano", "Chinese (Mandarin)", "Chinese (Cantonese)",
+    "Croatian", "Czech", "Danish", "Dutch", "English", "Estonian", "Finnish",
+    "French", "Galician", "Georgian", "German", "Greek", "Gujarati",
+    "Haitian Creole", "Hausa", "Hebrew", "Hindi", "Hungarian", "Icelandic",
+    "Igbo", "Indonesian", "Irish", "Italian", "Japanese", "Javanese",
+    "Kannada", "Kazakh", "Khmer", "Korean", "Kurdish", "Kyrgyz", "Lao",
+    "Latvian", "Lithuanian", "Luxembourgish", "Macedonian", "Malay",
+    "Malayalam", "Maltese", "Marathi", "Mongolian", "Nepali", "Norwegian",
+    "Pashto", "Persian (Farsi)", "Polish", "Portuguese", "Punjabi", "Romanian",
+    "Russian", "Serbian", "Sinhala", "Slovak", "Slovenian", "Somali",
+    "Spanish", "Swahili", "Swedish", "Tagalog", "Tamil", "Telugu", "Thai",
+    "Turkish", "Ukrainian", "Urdu", "Uzbek", "Vietnamese", "Welsh", "Yoruba",
+    "Zulu",
+])
+
+
+@app.get("/v1/translate/targets")
+def translate_targets():
+    return {"targets": sorted(TRANSLATE_TARGETS)}
+
+
+def _discard(path: str):
+    """Best-effort removal of a temp file (never masks the caller's error)."""
+    try:
+        os.unlink(path)
+    except OSError:
+        log.warning("Could not unlink %s", path)
 
 
 def _translate_target(lang: str, modifier: str) -> str | None:
     """Combine the translate form fields into a target like "Levantine Arabic".
-    Length-capped; returns None when no language was given."""
+
+    The language must be allowlisted and the modifier restricted to plain
+    words: both end up inside an LLM prompt that also carries untrusted
+    transcript text, so this is the only place they can be constrained.
+    Returns None when no language was given.
+    """
     lang, modifier = lang.strip()[:60], modifier.strip()[:40]
     if not lang:
         return None
+    if lang not in TRANSLATE_TARGETS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported translate_lang '{lang}'. See /v1/translate/targets.",
+        )
+    if modifier and not re.fullmatch(r"[\w \-']{1,40}", modifier):
+        raise HTTPException(status_code=400,
+                            detail="Invalid translate_modifier (letters, spaces, - and ' only).")
     return f"{modifier} {lang}".strip() if modifier else lang
 
 
@@ -486,6 +616,21 @@ def _all_voices() -> list[dict]:
     return voices
 
 
+_voice_cache: list[dict] | None = None
+
+
+def _known_voice_ids() -> set[str]:
+    """Cached voice ids.
+
+    Discovery resolves an HF cache path and scans voices/, so it runs once
+    rather than on every request (it also backs voice validation).
+    """
+    global _voice_cache
+    if _voice_cache is None:
+        _voice_cache = _all_voices()
+    return {v["id"] for v in _voice_cache}
+
+
 @app.get("/v1/tts/voices")
 def tts_voices():
     import tts
@@ -503,15 +648,15 @@ def create_speech(
         raise HTTPException(status_code=400, detail="text is required")
     if len(text) > 20000:
         raise HTTPException(status_code=400, detail="text too long (20000 chars max)")
-    known = {v["id"] for v in _all_voices()}
-    if voice not in known:
+    if voice not in _known_voice_ids():
         raise HTTPException(status_code=400,
                             detail=f"Unknown voice '{voice}'. See /v1/tts/voices.")
     try:
         wav = _tts_synthesize(text, voice, speed)
     except Exception as exc:
-        log.exception("TTS failed")
-        raise HTTPException(status_code=500, detail=str(exc))
+        err_id = uuid.uuid4().hex[:12]
+        log.exception("TTS failed (%s)", err_id)
+        raise HTTPException(status_code=500, detail=f"internal error (id {err_id})")
     return Response(content=wav, media_type="audio/wav")
 
 
@@ -523,12 +668,48 @@ def create_speech(
 
 _jobs: dict[str, dict] = {}
 _job_queue: queue.Queue = queue.Queue()
+# Liveness signals for /health: the worker bumps the heartbeat on every loop
+# iteration, so a dead thread (previously invisible) becomes detectable.
+_worker_heartbeat = time.time()
+_last_job_completed = time.time()
+
+
+def _set_job(job_id: str, **fields):
+    """Update a job record and stamp it (used for TTL expiry)."""
+    job = _jobs.setdefault(job_id, {})
+    job.update(fields)
+    job["updated_at"] = time.time()
+
+
+def _expire_jobs():
+    """Drop finished/failed jobs older than JOB_TTL_S.
+
+    Job results hold the transcript (and any TTS audio), so without this the
+    store grows without bound for the lifetime of the process.
+    """
+    cutoff = time.time() - JOB_TTL_S
+    for job_id, job in list(_jobs.items()):
+        if job.get("status") in ("done", "failed") and job.get("updated_at", 0) < cutoff:
+            log.info("Expiring job %s (%s)", job_id, job.get("status"))
+            del _jobs[job_id]
 
 
 def _maybe_speak(result: dict, speak_voice: str, speak_speed: float):
     """Attach TTS audio of the final text (cleaned if cleanup ran, else raw)
     as result["tts"]["audio_wav_b64"]. Enabled when speak_voice is non-empty."""
     if not speak_voice:
+        return
+    # Validate against the known voices: tts_silma builds
+    # os.path.join(VOICES_DIR, voice + ".wav") from this value, so an
+    # unvalidated id such as "silma_../../.." would escape voices/.
+    try:
+        if speak_voice not in _known_voice_ids():
+            result["tts"] = {"error": f"Unknown voice '{speak_voice}'. "
+                                      "See /v1/tts/voices."}
+            return
+    except Exception as exc:
+        log.warning("Voice list unavailable: %s", exc)
+        result["tts"] = {"error": "voice list unavailable"}
         return
     text = result["text"]
     cleanup = result.get("cleanup")
@@ -543,31 +724,83 @@ def _maybe_speak(result: dict, speak_voice: str, speak_speed: float):
         result["tts"] = {"error": str(exc)}
 
 
-def _job_worker():
-    while True:
-        (job_id, audio_path, model, language, punctuation, max_new_tokens,
-         cleanup, translate_to, speak_voice, speak_speed) = _job_queue.get()
-        _jobs[job_id]["status"] = "running"
+def _run_job(item: tuple):
+    """Process one queued job.
+
+    The GPU lock covers only load -> generate -> unload; LLM cleanup and TTS
+    run after it is released so they cannot block every other request for
+    minutes at a time.
+    """
+    global _last_job_completed
+    (job_id, audio_path, model, language, punctuation, max_new_tokens,
+     cleanup, translate_to, speak_voice, speak_speed) = item
+    _set_job(job_id, status="running")
+    result = None
+    try:
         with _model_lock:
             try:
-                result = _transcribe(audio_path, model, language, punctuation, max_new_tokens)
+                result = _transcribe(audio_path, model, language, punctuation,
+                                     max_new_tokens)
             except HTTPException as exc:
-                _jobs[job_id].update(status="failed", error=exc.detail)
+                _set_job(job_id, status="failed", error=exc.detail)
                 result = None
+            except torch.OutOfMemoryError:
+                # Observed failure mode on the 4 GB card: free VRAM and retry
+                # with the smallest mini-batch before giving up.
+                _free_vram()
+                try:
+                    result = _transcribe(audio_path, model, language, punctuation,
+                                         max_new_tokens, chunk_batch=1)
+                except torch.OutOfMemoryError:
+                    log.exception("Job %s failed (CUDA OOM)", job_id)
+                    _set_job(job_id, status="failed",
+                             error="GPU memory exhausted; retry with a shorter "
+                                   "file or a lower ASR_CHUNK_BATCH")
+                    result = None
             except Exception as exc:
-                log.exception("Job %s failed", job_id)
-                _jobs[job_id].update(status="failed", error=str(exc))
+                err_id = uuid.uuid4().hex[:12]
+                log.exception("Job %s failed (%s)", job_id, err_id)
+                _set_job(job_id, status="failed", error=f"internal error (id {err_id})")
                 result = None
             # Except-block names are cleared before this runs, so no live
             # traceback pins the model in memory here.
             unload_models()
-            os.unlink(audio_path)
-            if result is not None and cleanup:
+
+        if result is not None:
+            if cleanup:
                 # ASR model is out of VRAM now; gemma gets the GPU to itself.
                 result["cleanup"] = run_cleanup(result["text"], translate_to)
-            if result is not None:
-                _maybe_speak(result, speak_voice, speak_speed)
-                _jobs[job_id].update(status="done", result=result)
+            _maybe_speak(result, speak_voice, speak_speed)
+            _set_job(job_id, status="done", result=result)
+    finally:
+        try:
+            os.unlink(audio_path)
+        except OSError:
+            log.warning("Could not unlink %s", audio_path)
+        _last_job_completed = time.time()
+
+
+def _job_worker():
+    """Single background worker.
+
+    The loop body is fully guarded: previously an exception raised outside the
+    inner try (e.g. os.unlink) escaped the loop and killed the only worker,
+    leaving every later job stuck in "queued" forever with no error anywhere.
+    """
+    global _worker_heartbeat
+    while True:
+        item = _job_queue.get()
+        _worker_heartbeat = time.time()
+        try:
+            _run_job(item)
+        except Exception:
+            log.exception("Job %s failed unexpectedly", item[0] if item else "?")
+            try:
+                _set_job(item[0], status="failed", error="internal error")
+            except Exception:
+                pass
+        finally:
+            _job_queue.task_done()
 
 
 threading.Thread(target=_job_worker, daemon=True, name="asr-jobs").start()
@@ -575,10 +808,19 @@ threading.Thread(target=_job_worker, daemon=True, name="asr-jobs").start()
 
 @app.get("/v1/audio/transcriptions/jobs/{job_id}")
 def job_status(job_id: str):
+    _expire_jobs()  # natural sweep point: polling clients keep this path warm
     job = _jobs.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Unknown job '{job_id}'")
     return {"job_id": job_id, **job}
+
+
+@app.delete("/v1/audio/transcriptions/jobs/{job_id}")
+def delete_job(job_id: str):
+    """Drop a job and its transcript immediately (instead of waiting for TTL)."""
+    if _jobs.pop(job_id, None) is None:
+        raise HTTPException(status_code=404, detail=f"Unknown job '{job_id}'")
+    return {"job_id": job_id, "deleted": True}
 
 
 @app.post("/v1/audio/transcriptions")
@@ -600,19 +842,38 @@ def transcribe(
             status_code=400,
             detail=f"Unknown model '{model}'. Available: {sorted(MODELS)}",
         )
+    if not 16 <= max_new_tokens <= 1024:
+        raise HTTPException(status_code=400,
+                            detail="max_new_tokens must be between 16 and 1024")
+    if language is not None:
+        language = language.strip()[:32]
+        if language and not re.fullmatch(r"[A-Za-z+\-]{2,32}", language):
+            raise HTTPException(status_code=400, detail=f"Invalid language '{language}'")
+    if speak_voice and speak_voice not in _known_voice_ids():
+        raise HTTPException(status_code=400,
+                            detail=f"Unknown voice '{speak_voice}'. See /v1/tts/voices.")
     audio_path = _save_upload(file)
     translate_to = _translate_target(translate_lang, translate_modifier) if cleanup else None
 
     if background:
         # Return immediately; the client polls /v1/audio/transcriptions/jobs/<id>.
+        _expire_jobs()
+        if _job_queue.qsize() >= MAX_QUEUED_JOBS:
+            _discard(audio_path)
+            raise HTTPException(
+                status_code=503,
+                detail=f"Too many queued jobs (limit {MAX_QUEUED_JOBS}); retry shortly.",
+            )
         job_id = uuid.uuid4().hex
-        _jobs[job_id] = {"status": "queued", "model": model}
+        _set_job(job_id, status="queued", model=model)
         _job_queue.put((job_id, audio_path, model, language, punctuation, max_new_tokens,
                         cleanup, translate_to, speak_voice, speak_speed))
         return JSONResponse(status_code=202, content={"job_id": job_id, "status": "queued", "model": model})
 
-    # The whole request lifecycle runs under one lock: two models are never
-    # in VRAM at once, and a model is never unloaded mid-generation.
+    # The load -> generate -> unload lifecycle runs under one lock: two models
+    # are never in VRAM at once, and a model is never unloaded mid-generation.
+    # LLM cleanup and TTS must happen *outside* it — they can take minutes and
+    # would otherwise block every other request.
     with _model_lock:
         # Capture failures as plain data and re-raise afterwards: while an
         # exception is in flight its traceback keeps _transcribe's frame (and
@@ -621,9 +882,28 @@ def transcribe(
             result = _transcribe(audio_path, model, language, punctuation, max_new_tokens)
         except HTTPException as exc:
             status_code, detail = exc.status_code, exc.detail
+        except torch.OutOfMemoryError:
+            # Real, observed failure on the 4 GB card: release VRAM and retry
+            # with the smallest mini-batch before admitting defeat.
+            _free_vram()
+            try:
+                result = _transcribe(audio_path, model, language, punctuation,
+                                     max_new_tokens, chunk_batch=1)
+            except torch.OutOfMemoryError:
+                log.exception("Transcription failed (CUDA OOM)")
+                status_code, detail = (503, "GPU memory exhausted; retry with a "
+                                            "shorter file or a lower ASR_CHUNK_BATCH")
+            except Exception as exc:
+                err_id = uuid.uuid4().hex[:12]
+                log.exception("Transcription failed (%s)", err_id)
+                status_code, detail = 500, f"internal error (id {err_id})"
+            else:
+                status_code, detail = None, None
         except Exception as exc:
-            log.exception("Transcription failed")
-            status_code, detail = 500, str(exc)
+            # Log the detail, return only a correlation id.
+            err_id = uuid.uuid4().hex[:12]
+            log.exception("Transcription failed (%s)", err_id)
+            status_code, detail = 500, f"internal error (id {err_id})"
         else:
             status_code, detail = None, None
 
@@ -632,13 +912,13 @@ def transcribe(
         # when the next request switches models. No local in this frame (nor a
         # live traceback) references the model, so its tensors can be freed.
         unload_models()
-        os.unlink(audio_path)
-        if status_code is None and cleanup:
-            # ASR model is out of VRAM now; gemma gets the GPU to itself.
-            result["cleanup"] = run_cleanup(result["text"], translate_to)
-        if status_code is None:
-            _maybe_speak(result, speak_voice, speak_speed)
+
+    _discard(audio_path)
 
     if status_code is None:
+        if cleanup:
+            # ASR model is out of VRAM now; gemma gets the GPU to itself.
+            result["cleanup"] = run_cleanup(result["text"], translate_to)
+        _maybe_speak(result, speak_voice, speak_speed)
         return result
     raise HTTPException(status_code=status_code, detail=detail)

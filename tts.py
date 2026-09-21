@@ -13,6 +13,7 @@ GPU stays free for the ASR models.
 """
 
 import logging
+import os
 import re
 import sys
 import types
@@ -80,7 +81,11 @@ def available_voices() -> list[str]:
     from huggingface_hub import hf_hub_download
     import glob
     import os
-    path = hf_hub_download("hexgrad/Kokoro-82M", filename="voices/af_heart.pt")
+    # Offline by default: a cache miss must fail loudly, not download during a
+    # request (the caller holds the TTS lock while this runs).
+    offline = os.environ.get("TTS_LOCAL_FILES_ONLY", "1") not in ("0", "false", "")
+    path = hf_hub_download("hexgrad/Kokoro-82M", filename="voices/af_heart.pt",
+                           local_files_only=offline)
     voices_dir = os.path.dirname(path)
     return sorted(os.path.splitext(f)[0] for f in os.listdir(voices_dir) if f.endswith(".pt"))
 

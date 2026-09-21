@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install torch (CPU wheel)
+        # The GPU host needs the cu126 build (see requirements-torch.txt), but
+        # these tests never touch a GPU, so CI uses the plain CPU wheel.
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install dependencies
+        run: .venv/bin/pip install -r requirements.txt
+
+      - name: Syntax check the CLI client
+        run: .venv/bin/python -m py_compile app.py quant.py tts.py && .venv/bin/python -c "import ast;ast.parse(open('transcribe').read())"
+
+      - name: Run tests
+        env:
+          ASR_DEVICE: cpu
+          ASR_DTYPE: float32
+        run: .venv/bin/python -m pytest -q
