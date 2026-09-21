@@ -5,7 +5,13 @@ __pycache__/
 
 # Runtime artifacts
 *.log
+*.log.*
 *.pid
+
+# Voice-clone reference clips. Required at runtime (tts_silma.py reads
+# voices/<id>.wav + .txt) but deliberately NOT tracked: they are real voice
+# samples, so they stay local and out of history. Ship them out of band.
+voices/
 
 # Secrets / credentials — never commit
 api.key
