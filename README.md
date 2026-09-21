@@ -17,7 +17,15 @@ via `transformers>=5.4.0` (`AutoProcessor` + `CohereAsrForConditionalGeneration`
 The ivrit entry is a Whisper large-v3-turbo fine-tune for Hebrew in CTranslate2
 format, served via a second backend, `faster-whisper`. Weights are loaded from
 the local HuggingFace cache (`~/.cache/huggingface/hub/`) — no downloads
-required. No authentication.
+required (and enforced: `ASR_LOCAL_FILES_ONLY=1` by default, so a cache miss
+fails loudly instead of fetching mid-request).
+
+**Security posture.** The API itself implements no authentication. Access is
+gated in front of it, by a host firewall plus Cloudflare Zero Trust login;
+there is no unauthenticated public path to it. That is an accepted risk for
+this deployment, which is why the daemon still binds `0.0.0.0` by default. If
+you deploy it any other way, put an authenticating proxy in front of it, or
+start it with `--host 127.0.0.1`.
 
 ## Endpoints
 
@@ -256,6 +264,14 @@ cd /home/nolan/cohere-asr
 | `--chunk-batch N` | `ASR_CHUNK_BATCH` | `4` | Long-audio chunks per generate mini-batch (lower if OOM) |
 | — | `ASR_WHISPER_COMPUTE` | `int8` | ctranslate2 compute type for the faster-whisper backend (export before `start`; `int8_float16` needs CC ≥ 7.0 — not on the P1000) |
 | `--host` / `--port` | — | `0.0.0.0` / `8000` | Bind address |
+| — | `ASR_MAX_UPLOAD_MB` | `200` | Uploads above this are rejected with `413`; uploads are streamed to disk, never fully buffered |
+| — | `ASR_MAX_AUDIO_SECONDS` | `7200` | Decoded-duration cap (413 beyond it) |
+| — | `ASR_MAX_QUEUED_JOBS` | `32` | Background queue depth — further submits get `503` instead of queueing forever |
+| — | `ASR_JOB_TTL_S` | `3600` | Finished/failed jobs (which hold transcripts) are dropped after this long |
+| — | `ASR_OLLAMA_TIMEOUT` | `600` | Timeout for a single LLM cleanup call |
+| — | `ASR_LOCAL_FILES_ONLY` | `1` | Set `0` to allow downloading model weights (off by default) |
+| — | `ASR_MODEL_REVISIONS` | — | JSON integrity pin, e.g. `{"cohere-transcribe-03-2026": "<sha>"}` |
+| — | `ASR_MAX_WAIT_S` (CLI) | `3600` | Client gives up with an error instead of polling forever |
 
 Plain `uvicorn app:app --host 0.0.0.0 --port 8000` still works for
 foreground/debug runs.
@@ -303,7 +319,9 @@ drops ~2× overall (INT8 vs FP16 on the encoder's linear layers).
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
 # Torch cu126 build — required for the Quadro P1000, see notes
-.venv/bin/pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu126
+# torch / torchaudio first, from the PyTorch index — see requirements-torch.txt
+.venv/bin/pip install torch==2.13.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+.venv/bin/pip install torchaudio==2.11.0+cpu --index-url https://download.pytorch.org/whl/cpu
 .venv/bin/pip install -r requirements.txt
 ```
 
@@ -357,6 +375,44 @@ python3 -m venv .venv
   comfortable headroom (3.1 GB peak); 16+ OOMs the 4 GB card. Drop to 1–2
   only if ollama needs a few hundred extra MB during a transcription.
 
+## Background jobs
+
+`background=true` returns `202` + `job_id` and the work happens on a single
+worker thread. The queue is bounded (`ASR_MAX_QUEUED_JOBS`, `503` when full),
+finished jobs expire after `ASR_JOB_TTL_S`, and `DELETE
+/v1/audio/transcriptions/jobs/{id}` drops one immediately — job results hold
+the transcript, so they are not kept indefinitely.
+
+The worker's loop body is fully guarded: an unexpected error fails that one job
+and the thread keeps serving. If it ever did die, every job would sit in
+`queued` forever, which is why `/health` now reports `worker_alive`,
+`queue_depth` and `seconds_since_last_job` and returns `degraded` when the
+queue has not drained. Clients (`transcribe`, the web UI) also stop waiting
+after `ASR_MAX_WAIT_S` / 60 minutes instead of polling forever.
+
+## Data handling
+
+- Transcripts are held in memory only, expire with their job, and are never
+  written to the log — LLM failures log a length and a hash, not the payload.
+- Logs are per-port files rotated by `asr-server` above 20 MiB, and contain
+  client IPs, so treat them as personal data.
+- `voices/` (SILMA voice-clone references) is **not tracked** — the files are
+  needed at runtime but are real voice samples, so keep them out of the
+  repository and ship them out of band.
+- `comparison/*.txt` are real transcripts kept as benchmark fixtures; they are
+  a deliberate retention choice, not an oversight.
+
+## Tests
+
+```bash
+ASR_DEVICE=cpu ASR_DTYPE=float32 .venv/bin/python -m pytest -q
+```
+
+Covers input validation (upload caps, voice allowlist, token/language bounds),
+job lifecycle (TTL, DELETE, backpressure), worker resilience, health
+reporting, and the CLI's credential rules. No model is loaded and no network
+call is made.
+
 ## Limitations (from the model card)
 
 - Best with a single pre-specified language; no automatic language detection.
@@ -373,11 +429,14 @@ cohere-asr/
 ├── quant.py           # INT8 encoder quantization (Int8Linear)
 ├── tts.py             # Kokoro-82M TTS (espeak G2P routing)
 ├── tts_silma.py       # SILMA TTS (Arabic/English voice cloning)
-├── voices/            # SILMA reference clips (<id>.wav + <id>.txt)
+├── voices/            # SILMA reference clips (<id>.wav + <id>.txt) — NOT tracked
 ├── asr-server         # daemon manager (start/stop/status/logs)
 ├── transcribe         # CLI client (upload + poll + save)
+├── tests/             # pytest suite (no model loads, no network)
+├── .github/workflows/ # CI
 ├── comparison/        # benchmark scripts and transcripts
-├── requirements.txt   # Python dependencies
+├── requirements.txt   # Python dependencies (pinned)
+├── requirements-torch.txt  # torch/torchaudio pins (PyTorch index, install first)
 ├── .venv/             # virtualenv with the verified stack
 ├── asr-server.*.log   # daemon logs, per port (created at runtime)
 ├── asr-server.*.pid   # daemon pidfiles, per port (created at runtime)

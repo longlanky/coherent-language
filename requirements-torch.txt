@@ -1,0 +1,18 @@
+# torch / torchaudio pins. Install these BEFORE requirements.txt, from the
+# PyTorch index — they are not on PyPI in the build this host needs.
+#
+#   .venv/bin/pip install torch==2.13.0+cu126 \
+#       --index-url https://download.pytorch.org/whl/cu126
+#   .venv/bin/pip install torchaudio==2.11.0+cpu \
+#       --index-url https://download.pytorch.org/whl/cpu
+#
+# Why: the Quadro P1000 is Pascal / sm_61 and the stock cu130 wheel ships no
+# kernels for it, so the cu126 build is required. torchaudio 2.11+ is
+# torchcodec-backed and its native lib will not load here, so tts_silma.py
+# shims torchaudio.load through soundfile.
+#
+# CI installs the plain CPU wheel instead (tests never touch the GPU):
+#   pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
+
+torch==2.13.0+cu126
+torchaudio==2.11.0+cpu
