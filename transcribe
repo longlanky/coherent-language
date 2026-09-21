@@ -27,12 +27,26 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
 
 POLL_EVERY = 5
+# Give up rather than poll forever: a lost job (server restart) or a dead
+# worker used to make this loop print dots indefinitely.
+MAX_WAIT_S = int(os.environ.get("ASR_MAX_WAIT_S", "3600"))
 SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_SERVER = "https://asr.ninefive.cc"
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+# The credential is only sent to these hosts unless --send-credentials is given.
+TRUSTED_HOSTS = {urllib.parse.urlparse(DEFAULT_SERVER).hostname}
+
+
+def server_host(server: str) -> str:
+    """Hostname of a server URL (exact match, not a substring test —
+    'localhost.evil.example' must not count as local)."""
+    return (urllib.parse.urlparse(server).hostname or "").lower()
 
 
 def pick_file() -> Path:
@@ -94,7 +108,7 @@ def main() -> int:
     p = argparse.ArgumentParser(
         description="Upload audio to the ASR server and save the transcript.")
     p.add_argument("audio", nargs="?", help="Audio file (omit for a GUI file picker)")
-    p.add_argument("--server", default=os.environ.get("ASR_SERVER", "https://asr.ninefive.cc"))
+    p.add_argument("--server", default=os.environ.get("ASR_SERVER", DEFAULT_SERVER))
     p.add_argument("--model", default=os.environ.get("ASR_MODEL"), help="Model id (default: server's)")
     p.add_argument("--language", default=os.environ.get("ASR_LANGUAGE"), help="e.g. ar, en")
     p.add_argument("--no-punctuation", action="store_true")
@@ -109,6 +123,9 @@ def main() -> int:
                         "optional voice id (default af_heart, see /v1/tts/voices). "
                         "Saves <name>.<voice>.wav")
     p.add_argument("--cookie", help="Cloudflare Access JWT (CF_Authorization)")
+    p.add_argument("--send-credentials", action="store_true",
+                   help="Allow sending the Cloudflare JWT to a host other than "
+                        f"{DEFAULT_SERVER} (off by default)")
     p.add_argument("--output", help="Transcript output path (default: <audio>.<model>.txt)")
     args = p.parse_args()
 
@@ -116,9 +133,14 @@ def main() -> int:
     if not audio.is_file():
         sys.exit(f"File not found: {audio}")
 
-    is_local = any(h in args.server for h in ("localhost", "127.0.0.1", "[::1]"))
+    host = server_host(args.server)
+    is_local = host in LOCAL_HOSTS
     headers = {}
     cookie = get_cookie(args)
+    if cookie and not is_local and host not in TRUSTED_HOSTS and not args.send_credentials:
+        sys.exit(f"Refusing to send the Cloudflare credential to '{host}'.\n"
+                 f"Known endpoint: {', '.join(sorted(TRUSTED_HOSTS))}. "
+                 f"Pass --send-credentials to override.")
     if cookie and not is_local:
         headers["Cookie"] = f"CF_Authorization={cookie}"
     elif not cookie and not is_local:
@@ -146,6 +168,7 @@ def main() -> int:
     job_id, model = job["job_id"], job.get("model", "?")
     print(f"Job {job_id} queued (model: {model}). Waiting", end="", flush=True)
 
+    deadline = t0 + MAX_WAIT_S
     while True:
         time.sleep(POLL_EVERY)
         print(".", end="", flush=True)
@@ -155,6 +178,11 @@ def main() -> int:
         status = job.get("status")
         if status in ("done", "failed"):
             break
+        if time.time() > deadline:
+            sys.exit(f"\nTimed out after {MAX_WAIT_S}s — job {job_id} is still "
+                     f"'{status}'. Re-poll later with:\n"
+                     f"  curl -H 'Cookie: CF_Authorization=<jwt>' "
+                     f"{args.server}/v1/audio/transcriptions/jobs/{job_id}")
     elapsed = time.time() - t0
     print()
 
