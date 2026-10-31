@@ -94,6 +94,57 @@ def test_local_server_is_not_sent_a_credential(cli, monkeypatch, tmp_path):
     assert all(not req.get_header("Cookie") for req in seen)
 
 
+def test_list_llm_models_queries_server(cli, monkeypatch, capsys):
+    seen = []
+
+    def fake_http_json(req):
+        seen.append(req.full_url)
+        return {"models": [{"id": "deepseek-flash"}, {"id": "deepseek-v4-pro"}]}
+
+    monkeypatch.setattr(cli, "http_json", fake_http_json)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["transcribe", "--server", "http://127.0.0.1:8000",
+         "--list-llm-models", "deepseek"],
+    )
+    assert cli.main() == 0
+    out = capsys.readouterr().out
+    assert "deepseek-flash" in out
+    assert "deepseek-v4-pro" in out
+    assert "provider=deepseek" in seen[0]
+
+
+def test_cleanup_sends_llm_selection(cli, monkeypatch, tmp_path):
+    audio = tmp_path / "clip.wav"
+    audio.write_bytes(b"RIFF" + b"\0" * 32)
+    seen = []
+
+    def fake_http_json(req):
+        seen.append(req)
+        if req.get_method() == "POST":
+            return {"job_id": "stub", "status": "queued"}
+        return {"status": "done",
+                "result": {"text": "hello", "model": "m", "duration_s": 1}}
+
+    monkeypatch.setattr(cli, "http_json", fake_http_json)
+    monkeypatch.setattr(cli, "get_cookie", lambda _args: None)
+    monkeypatch.setattr(cli, "MAX_WAIT_S", 30)
+    monkeypatch.setattr(cli, "POLL_EVERY", 0)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["transcribe", str(audio), "--server", "http://127.0.0.1:8000",
+         "--cleanup", "--llm-provider", "deepseek",
+         "--llm-model", "deepseek-flash",
+         "--output", str(tmp_path / "out.txt")],
+    )
+    assert cli.main() == 0
+    body = seen[0].data
+    assert b'name="llm_provider"' in body
+    assert b"deepseek" in body
+    assert b'name="llm_model"' in body
+    assert b"deepseek-flash" in body
+
+
 def test_untrusted_remote_host_refuses_the_credential(cli, monkeypatch, tmp_path):
     audio = tmp_path / "clip.wav"
     audio.write_bytes(b"RIFF" + b"\0" * 32)

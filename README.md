@@ -43,6 +43,8 @@ Long-form audio (>35 s) is chunked and reassembled automatically.
 | `max_new_tokens` | int | `256` | Generation cap |
 | `background` | bool | `false` | `true` → return `202` + `job_id` immediately instead of waiting |
 | `cleanup` | bool | `false` | `true` → LLM post-process the transcript (see *LLM post-cleanup*) |
+| `llm_provider` | string | server default | with `cleanup=true`: `ollama`, `deepseek`, `anthropic`, or `openai` |
+| `llm_model` | string | server default | with `cleanup=true`: model id from `/v1/llm/models` |
 | `translate_lang` | string | — | with `cleanup=true`: translate the cleaned transcript into this language |
 | `translate_modifier` | string | — | optional modifier combined as "{modifier} {lang}", e.g. `Levantine` + `Arabic` (≤ 40 chars) |
 
@@ -98,6 +100,18 @@ Returns `{"job_id", "status", ...}` — `result` when `done`, `error` when `fail
 
 Lists registered models, default languages, and whether each is loaded.
 
+### `GET /v1/llm/providers`
+
+Lists the cleanup providers enabled on this server, their base URLs, default
+models, and whether their key is configured. API keys are never returned.
+
+### `GET /v1/llm/models?provider=deepseek&refresh=false`
+
+Queries the selected provider's live model list (not a static list) and returns
+`{provider, base_url, models: [{id, label}], cached}`. Results are cached for
+60 seconds; `refresh=true` bypasses the cache. Provider errors are returned as
+`502` with the upstream message.
+
 ### `GET /health`
 
 Returns `{"status": "ok"}`.
@@ -143,20 +157,62 @@ A user-facing page is served at `/` (API docs stay at `/docs`):
 
 ## LLM post-cleanup (optional)
 
-Pass `cleanup=true` (form field) to post-process the transcript with a local
-ollama LLM (`gemma4:e2b` at `http://10.200.100.5:11434`, override with
-`OLLAMA_HOST` / `OLLAMA_MODEL`). The prompts in
-`llm-post-processing-system-prompt.txt` / `llm-post-processing-user-prompt.txt`
-make it add punctuation/capitalization, format numbers/dates, and
-conservatively remove ASR artifacts while preserving every spoken word
-(including fillers), for English, Arabic, and code-switched text.
+Pass `cleanup=true` (form field) to post-process the transcript with an LLM.
+Provider configuration lives on the server (environment variables); request
+bodies may select an enabled provider and model but never carry an API key.
+The prompts in `llm-post-processing-system-prompt.txt` /
+`llm-post-processing-user-prompt.txt` make it add punctuation/capitalization,
+format numbers/dates, and conservatively remove ASR artifacts while preserving
+every spoken word (including fillers), for English, Arabic, and code-switched
+text.
 
-- Runs **after** the ASR model is evicted from VRAM, and the LLM is always
-  unloaded afterwards (`keep_alive: 0`) — verified via `/api/ps` → empty and
-  VRAM back at baseline.
+| Provider | Default endpoint | Model list | Key |
+|---|---|---|---|
+| `ollama` | `http://127.0.0.1:11434` (local loopback) | `GET /api/tags` | none (optional `OLLAMA_API_KEY` for a proxied remote) |
+| `deepseek` | `https://api.deepseek.com` | `GET /models` | `DEEPSEEK_API_KEY` |
+| `anthropic` | `https://api.anthropic.com` | `GET /v1/models` | `ANTHROPIC_API_KEY` |
+| `openai` | `OPENAI_BASE_URL` (required) | `GET {base}/models` | `OPENAI_API_KEY` (optional) |
+
+`LLM_PROVIDERS` selects which providers the server exposes. When unset, Ollama
+is always enabled and each remote provider is enabled automatically when its
+key is configured (`OPENAI_BASE_URL` for the generic provider).
+
+```bash
+# Local Ollama (default loopback)
+LLM_PROVIDERS=ollama ./asr-server start ...
+
+# Remote Ollama
+LLM_PROVIDERS=ollama OLLAMA_HOST=http://10.200.100.5:11434 ./asr-server start ...
+
+# DeepSeek
+LLM_PROVIDERS=ollama,deepseek LLM_PROVIDER=deepseek LLM_MODEL=deepseek-flash \
+DEEPSEEK_API_KEY=... ./asr-server start ...
+
+# Anthropic
+LLM_PROVIDERS=ollama,anthropic LLM_PROVIDER=anthropic LLM_MODEL=claude-sonnet-4-5 \
+ANTHROPIC_API_KEY=... ./asr-server start ...
+
+# Any OpenAI-compatible endpoint (vLLM, LM Studio, OpenAI, …)
+LLM_PROVIDERS=ollama,openai LLM_PROVIDER=openai \
+OPENAI_BASE_URL=http://localhost:1234/v1 OPENAI_API_KEY=... ./asr-server start ...
+```
+
+Models are queried from the endpoint, never from a static list:
+
+```bash
+curl 'http://localhost:8000/v1/llm/models?provider=deepseek'
+# {"provider":"deepseek","base_url":"https://api.deepseek.com",
+#  "models":[{"id":"deepseek-flash",...},{"id":"deepseek-v4-pro",...}]}
+```
+
+- Runs **after** the ASR model is evicted from VRAM. Ollama models are unloaded
+  afterwards (`keep_alive: 0`) unless `LLM_OLLAMA_UNLOAD=0` — verified via
+  `/api/ps` → empty and VRAM back at baseline.
 - The result gains a `cleanup` object: `cleaned_text`, `changes[]` (type,
-  original, replacement, reason, confidence), `warnings[]`. On LLM failure the
-  transcription still succeeds and `cleanup.error` is set instead.
+  original, replacement, reason, confidence), `warnings[]`, and
+  `llm {provider, model}`. On an upstream LLM failure the transcription still
+  succeeds and `cleanup.error` is set instead. An invalid provider/model
+  selection is rejected with `400` before the upload.
 - **Optional translation**: set `translate_lang` (e.g. `French`) and optionally
   `translate_modifier` (e.g. `Levantine`, combined as "Levantine Arabic") —
   the core cleaning rules still run first, then the cleaned text is
@@ -164,11 +220,18 @@ conservatively remove ASR artifacts while preserving every spoken word
   `cleanup.translation.target` echoes the target. The web UI gates this
   behind a checkbox with a type-to-narrow language autocomplete (~95 major
   languages) and a 40-char-capped modifier box.
-- Web UI: "Clean up transcript with LLM" checkbox → second result card with
-  the cleaned text, per-change highlighted deltas (badge + strikethrough →
-  replacement + reason + confidence), warnings, Copy and Download buttons.
-- CLI: `./transcribe file.mp3 --cleanup` also saves `<name>.cleaned.txt`;
-  add `--translate French [--translate-modifier ...]` for translation.
+- Web UI: "Clean up transcript with an LLM" checkbox reveals provider and
+  model pickers populated from `/v1/llm/providers` and `/v1/llm/models`; the
+  result card shows the cleaned text, per-change highlighted deltas (badge +
+  strikethrough → replacement + reason + confidence), warnings, Copy and
+  Download buttons.
+- CLI: `./transcribe file.mp3 --cleanup` also saves `<name>.cleaned.txt`.
+  Use `--llm-provider` / `--llm-model` to choose the cleanup backend and
+  `--list-llm-models deepseek` to query the server's model list. Add
+  `--translate French [--translate-modifier ...]` for translation.
+- The module is reusable outside the API:
+  `python llm_cleanup.py transcript.txt --provider deepseek --model deepseek-flash`
+  (keys from the environment).
 
 ## Text to speech (Kokoro-82M)
 
@@ -227,10 +290,13 @@ path is given and available, otherwise a terminal prompt.
 ./transcribe sermon.mp3 --language ar    # saves sermon.cohere-transcribe-arabic-07-2026-int8enc.txt
 ./transcribe sermon.mp3 --output out.txt --no-punctuation
 ./transcribe sermon.mp3 --server http://127.0.0.1:8000   # local server, no auth
+./transcribe sermon.mp3 --cleanup --llm-provider deepseek --llm-model deepseek-flash
+./transcribe --list-llm-models deepseek                 # query the server's model list
 ```
 
 - Defaults to the public endpoint `https://asr.ninefive.cc` (override with
-  `--server` or `ASR_SERVER`; also `ASR_MODEL`, `ASR_LANGUAGE`).
+  `--server` or `ASR_SERVER`; also `ASR_MODEL`, `ASR_LANGUAGE`,
+  `ASR_LLM_PROVIDER`, `ASR_LLM_MODEL`).
 - For the Cloudflare-Access endpoint it needs the `CF_Authorization` JWT via
   `--cookie`, the `CF_AUTHORIZATION` env var, or a `./cf.jwt` file (note: the
   cookie expires ~24 h after browser login). Localhost servers skip auth.
@@ -268,7 +334,20 @@ cd /home/nolan/cohere-asr
 | — | `ASR_MAX_AUDIO_SECONDS` | `7200` | Decoded-duration cap (413 beyond it) |
 | — | `ASR_MAX_QUEUED_JOBS` | `32` | Background queue depth — further submits get `503` instead of queueing forever |
 | — | `ASR_JOB_TTL_S` | `3600` | Finished/failed jobs (which hold transcripts) are dropped after this long |
-| — | `ASR_OLLAMA_TIMEOUT` | `600` | Timeout for a single LLM cleanup call |
+| — | `LLM_PROVIDERS` | Ollama + configured remote providers | Comma-separated providers to expose (`ollama,deepseek,anthropic,openai`) |
+| — | `LLM_PROVIDER` | first enabled (`ollama` normally) | Default cleanup provider |
+| — | `LLM_MODEL` | — | Default cleanup model; provider-specific `LLM_MODEL_<PROVIDER>` also works |
+| — | `LLM_BASE_URL` | — | Override the default/single provider's base URL |
+| — | `LLM_API_KEY` | — | Override the default/single provider's API key |
+| — | `OLLAMA_HOST` | `http://127.0.0.1:11434` | Remote Ollama endpoint (omit for local loopback) |
+| — | `OLLAMA_MODEL` | first listed model | Legacy Ollama model fallback |
+| — | `DEEPSEEK_API_KEY` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | — | Provider API keys (server-side only) |
+| — | `DEEPSEEK_BASE_URL` / `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` | built-in / required | Provider endpoint overrides |
+| — | `LLM_TIMEOUT` | `600` | Timeout for one cleanup call (`ASR_OLLAMA_TIMEOUT` still honored) |
+| — | `LLM_MODELS_TIMEOUT` | `15` | Timeout for a model-list query |
+| — | `LLM_MODELS_TTL` | `60` | Cache lifetime for queried model lists (seconds) |
+| — | `LLM_MAX_TOKENS` | provider default | Output cap; Anthropic defaults to 8192 |
+| — | `LLM_OLLAMA_UNLOAD` | `1` | Set `0` to leave the Ollama model resident after cleanup |
 | — | `ASR_LOCAL_FILES_ONLY` | `1` | Set `0` to allow downloading model weights (off by default) |
 | — | `ASR_MODEL_REVISIONS` | — | JSON integrity pin, e.g. `{"cohere-transcribe-03-2026": "<sha>"}` |
 | — | `ASR_MAX_WAIT_S` (CLI) | `3600` | Client gives up with an error instead of polling forever |
@@ -357,6 +436,10 @@ python3 -m venv .venv
   *" ففي الحالة دي المسألة دي يعني more safe"*
   (identical for FP16 and `-int8enc`)
 - Error paths: unknown model → 400 with available ids; non-audio file → 400.
+- **LLM cleanup providers**: DeepSeek's live `/models` returned
+  `deepseek-flash` and `deepseek-v4-pro`; cleanup and translation both produced
+  valid JSON. Ollama and Anthropic request/response shapes are covered by the
+  mocked-HTTP tests.
 - **Chunked vs single-batch parity** (same `arabic-07-2026-int8enc` model, GPU
   mini-batches of 4 vs CPU single batch, 4 files incl. a 24-min/42-chunk one):
   3 of 4 byte-identical; the 4th differed in exactly one word
@@ -410,8 +493,9 @@ ASR_DEVICE=cpu ASR_DTYPE=float32 .venv/bin/python -m pytest -q
 
 Covers input validation (upload caps, voice allowlist, token/language bounds),
 job lifecycle (TTL, DELETE, backpressure), worker resilience, health
-reporting, and the CLI's credential rules. No model is loaded and no network
-call is made.
+reporting, the CLI's credential rules, and every LLM provider's request/response
+shape (`tests/test_llm_cleanup.py`). Provider HTTP calls are mocked, so no model
+is loaded and no external network call is made during the test suite.
 
 ## Limitations (from the model card)
 

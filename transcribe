@@ -13,11 +13,14 @@ Usage:
   ./transcribe                                # GUI file picker (zenity) or prompt
   ./transcribe audio.mp3 --language ar --model cohere-transcribe-arabic-07-2026-int8enc
   ./transcribe audio.mp3 --server http://127.0.0.1:8000 --output out.txt
+  ./transcribe audio.mp3 --cleanup --llm-provider deepseek --llm-model deepseek-flash
+  ./transcribe --list-llm-models deepseek     # query the server's model list
 
 Auth (only needed for the Cloudflare-Access-protected public endpoint):
   --cookie JWT | env CF_AUTHORIZATION | file ./cf.jwt  (first found wins)
 
-Env vars: ASR_SERVER (default https://asr.ninefive.cc), ASR_MODEL, ASR_LANGUAGE.
+Env vars: ASR_SERVER (default https://asr.ninefive.cc), ASR_MODEL, ASR_LANGUAGE,
+ASR_LLM_PROVIDER, ASR_LLM_MODEL.
 """
 
 import argparse
@@ -113,11 +116,18 @@ def main() -> int:
     p.add_argument("--language", default=os.environ.get("ASR_LANGUAGE"), help="e.g. ar, en")
     p.add_argument("--no-punctuation", action="store_true")
     p.add_argument("--cleanup", action="store_true",
-                   help="Post-process with the ollama LLM (gemma4:e2b); also saves <name>.cleaned.txt")
+                   help="Post-process with the server's LLM; also saves <name>.cleaned.txt")
     p.add_argument("--translate", metavar="LANG",
                    help="Also translate the cleaned transcript into LANG (e.g. French)")
     p.add_argument("--translate-modifier", metavar="TEXT",
                    help="Optional modifier for the target, e.g. 'Levantine' with --translate Arabic")
+    p.add_argument("--llm-provider", default=os.environ.get("ASR_LLM_PROVIDER"),
+                   help="Cleanup provider: ollama, deepseek, anthropic, or openai "
+                        "(default: server's)")
+    p.add_argument("--llm-model", default=os.environ.get("ASR_LLM_MODEL"),
+                   help="Cleanup model id from the provider's queried model list")
+    p.add_argument("--list-llm-models", nargs="?", const="", metavar="PROVIDER",
+                   help="List the server's available cleanup models and exit")
     p.add_argument("--speak", nargs="?", const="af_heart", default="", metavar="VOICE",
                    help="Also synthesize the (cleaned) transcript with Kokoro TTS; "
                         "optional voice id (default af_heart, see /v1/tts/voices). "
@@ -128,10 +138,6 @@ def main() -> int:
                         f"{DEFAULT_SERVER} (off by default)")
     p.add_argument("--output", help="Transcript output path (default: <audio>.<model>.txt)")
     args = p.parse_args()
-
-    audio = Path(args.audio).expanduser() if args.audio else pick_file()
-    if not audio.is_file():
-        sys.exit(f"File not found: {audio}")
 
     host = server_host(args.server)
     is_local = host in LOCAL_HOSTS
@@ -147,12 +153,31 @@ def main() -> int:
         print("note: no Cloudflare cookie found (--cookie / CF_AUTHORIZATION / ./cf.jwt); "
               "the public endpoint may redirect to a login page.", file=sys.stderr)
 
+    if args.list_llm_models is not None:
+        provider = args.list_llm_models or args.llm_provider or ""
+        params = {"refresh": "true"}
+        if provider:
+            params["provider"] = provider
+        url = f"{args.server}/v1/llm/models?" + urllib.parse.urlencode(params)
+        data = http_json(urllib.request.Request(url, headers=headers))
+        for model in data.get("models", []):
+            print(model.get("id", ""))
+        return 0
+
+    audio = Path(args.audio).expanduser() if args.audio else pick_file()
+    if not audio.is_file():
+        sys.exit(f"File not found: {audio}")
+
     fields = {"background": "true", "punctuation": str(not args.no_punctuation).lower(),
               "cleanup": str(bool(args.cleanup or args.translate)).lower()}
     if args.translate:
         fields["translate_lang"] = args.translate
         if args.translate_modifier:
             fields["translate_modifier"] = args.translate_modifier
+    if args.llm_provider:
+        fields["llm_provider"] = args.llm_provider
+    if args.llm_model:
+        fields["llm_model"] = args.llm_model
     if args.speak:
         fields["speak_voice"] = args.speak
     if args.model:
@@ -208,7 +233,11 @@ def main() -> int:
             cleaned_out = audio.with_suffix(".cleaned.txt")
             cleaned_out.write_text(cleaned + "\n")
             target = cleanup.get("translation", {}).get("target")
-            print(f"\n--- cleaned transcript ({len(cleanup.get('changes', []))} changes, "
+            llm = cleanup.get("llm") or {}
+            via = (f" via {llm['provider']}/{llm['model']}"
+                   if llm.get("provider") else "")
+            print(f"\n--- cleaned transcript{via} "
+                  f"({len(cleanup.get('changes', []))} changes, "
                   f"{len(cleanup.get('warnings', []))} warnings"
                   f"{', translated to ' + target if target else ''}) ---\n")
             print(cleaned)
@@ -224,6 +253,7 @@ def main() -> int:
             wav_out = audio.with_suffix(f".{voice}.wav")
             wav_out.write_bytes(base64.b64decode(tts_result["audio_wav_b64"]))
             print(f"\n--- speech saved to {wav_out} ---")
+    return 0
 
 
 if __name__ == "__main__":

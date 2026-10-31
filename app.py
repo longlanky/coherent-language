@@ -10,7 +10,6 @@ Run:  .venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000
 
 import base64
 import gc
-import hashlib
 import json
 import logging
 import os
@@ -21,13 +20,15 @@ import tempfile
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 
-import requests
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from transformers import AutoProcessor, CohereAsrForConditionalGeneration
 from transformers.audio_utils import load_audio
+
+import llm_cleanup
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("cohere-asr")
@@ -45,22 +46,10 @@ MAX_QUEUED_JOBS = int(os.environ.get("ASR_MAX_QUEUED_JOBS", "32"))
 # Finished/failed jobs are dropped after this long (they hold transcripts and
 # any TTS audio), so memory cannot grow without bound.
 JOB_TTL_S = int(os.environ.get("ASR_JOB_TTL_S", "3600"))
-# Wall-clock budget for one LLM cleanup call.
-OLLAMA_TIMEOUT = int(os.environ.get("ASR_OLLAMA_TIMEOUT", "600"))
 # Model weights come from the local HF cache; never fetch during a request.
 LOCAL_FILES_ONLY = os.environ.get("ASR_LOCAL_FILES_ONLY", "1") not in ("0", "false", "")
 # Optional integrity pin: {"model-id": "revision-sha", ...} as JSON.
 _MODEL_REVISIONS = json.loads(os.environ.get("ASR_MODEL_REVISIONS", "{}") or "{}")
-
-# Optional LLM post-cleanup via a local ollama instance. The prompts live in
-# repo files next to this module.
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://10.200.100.5:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:e2b")
-_here = os.path.dirname(os.path.abspath(__file__))
-with open(os.path.join(_here, "llm-post-processing-system-prompt.txt")) as _f:
-    _CLEANUP_SYSTEM_PROMPT = _f.read()
-with open(os.path.join(_here, "llm-post-processing-user-prompt.txt")) as _f:
-    _CLEANUP_USER_TEMPLATE = _f.read()
 
 MODELS = {
     "cohere-transcribe-03-2026": {
@@ -147,109 +136,14 @@ def unload_models():
     _free_vram()
 
 
-def _unload_ollama():
-    """Force the ollama model out of RAM/VRAM (keep_alive=0)."""
-    try:
-        requests.post(f"{OLLAMA_HOST}/api/generate",
-                      json={"model": OLLAMA_MODEL, "keep_alive": 0}, timeout=30)
-        log.info("Unloaded %s from ollama", OLLAMA_MODEL)
-    except Exception:
-        log.warning("Failed to unload %s from ollama", OLLAMA_MODEL, exc_info=True)
+def run_cleanup(raw_text: str, translate_to: str | None = None,
+                llm: llm_cleanup.LLMConfig | None = None) -> dict:
+    """Post-process a transcript with the configured LLM provider.
 
-
-def _ollama_chat(messages: list[dict]) -> str:
-    """One JSON-mode chat call; returns the message content string."""
-    resp = requests.post(
-        f"{OLLAMA_HOST}/api/chat",
-        json={"model": OLLAMA_MODEL, "messages": messages,
-              "stream": False, "format": "json",
-              "options": {"num_predict": -1}},  # never truncate mid-JSON
-        timeout=OLLAMA_TIMEOUT,  # long transcripts on a shared 4 GB GPU take minutes
-    )
-    resp.raise_for_status()
-    return resp.json()["message"]["content"]
-
-
-def _parse_json(content: str) -> dict:
-    # Tolerate stray markdown fences despite format:"json", raw control
-    # characters inside strings (strict=False), and any leading/trailing
-    # prose around the JSON object.
-    cleaned = content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    start, end = cleaned.find("{"), cleaned.rfind("}")
-    if start != -1 and end > start:
-        cleaned = cleaned[start:end + 1]
-    data = json.loads(cleaned, strict=False)
-    if not isinstance(data, dict):
-        raise ValueError(f"unexpected payload: {content[:200]}")
-    return data
-
-
-def _ollama_chat_json(messages: list[dict], attempts: int = 3) -> dict:
-    """_ollama_chat + _parse_json with retries: the model intermittently
-    emits malformed JSON (observed ~1 in 5 longer runs)."""
-    last_exc: Exception | None = None
-    for attempt in range(1, attempts + 1):
-        content = _ollama_chat(messages)
-        try:
-            return _parse_json(content)
-        except (json.JSONDecodeError, ValueError) as exc:
-            last_exc = exc
-            log.warning("LLM returned invalid JSON (attempt %d/%d): %s", attempt, attempts, exc)
-            # Never log the payload: it is transcript content (personal data).
-            # Length + hash are enough to correlate repeat failures.
-            log.warning("invalid LLM payload: len=%d sha256=%s", len(content),
-                        hashlib.sha256(content.encode()).hexdigest()[:16])
-    raise last_exc
-
-
-def run_cleanup(raw_text: str, translate_to: str | None = None) -> dict:
-    """Post-process a transcript with the ollama LLM.
-
-    Returns {"cleaned_text", "changes", "warnings"} on success, or
-    {"error": ...} on failure. The ollama model is always unloaded again.
-
-    When translate_to is set (e.g. "French" or "Levantine Arabic") a second
-    LLM pass translates the cleaned text — a single combined prompt proved
-    unreliable (the model returned untranslated cleaned text). cleaned_text
-    then holds the translation; changes/warnings come from the cleaning pass.
+    Kept as a thin compatibility wrapper; all provider logic lives in
+    llm_cleanup.py so it can also be used outside the HTTP service.
     """
-    log.info("Running LLM cleanup with %s (%d chars, translate_to=%s)",
-             OLLAMA_MODEL, len(raw_text), translate_to)
-    try:
-        data = _ollama_chat_json([
-            {"role": "system", "content": _CLEANUP_SYSTEM_PROMPT},
-            {"role": "user", "content": _CLEANUP_USER_TEMPLATE.replace("{raw_transcript}", raw_text)},
-        ])
-        if "cleaned_text" not in data:
-            raise ValueError(f"unexpected cleanup payload: {str(data)[:200]}")
-        data.setdefault("changes", [])
-        data.setdefault("warnings", [])
-
-        if translate_to:
-            log.info("Translating cleaned text to %s", translate_to)
-            tr_data = _ollama_chat_json([
-                {"role": "system", "content": (
-                    "You are a professional translator. Translate the user's text "
-                    f"into {translate_to}. Translate faithfully and completely — do "
-                    "not summarize, condense, or omit anything, and do not add "
-                    "commentary. Return ONLY a JSON object of the form "
-                    '{"translation": "..."}.')},
-                {"role": "user", "content": data["cleaned_text"]},
-            ])
-            translated = tr_data.get("translation") or tr_data.get("cleaned_text")
-            if not translated:
-                raise ValueError(f"unexpected translation payload: {str(tr_data)[:200]}")
-            data["cleaned_text"] = translated
-            data["translation"] = {"target": translate_to}
-
-        log.info("Cleanup done: %d changes, %d warnings",
-                 len(data["changes"]), len(data["warnings"]))
-        return data
-    except Exception as exc:
-        log.exception("LLM cleanup failed")
-        return {"error": str(exc)}
-    finally:
-        _unload_ollama()
+    return llm_cleanup.clean_transcript(raw_text, translate_to, llm)
 
 
 def get_model(name: str):
@@ -660,6 +554,32 @@ def create_speech(
     return Response(content=wav, media_type="audio/wav")
 
 
+# --- LLM cleanup providers -------------------------------------------------
+# Keys and base URLs are configured server-side (see llm_cleanup.py). These
+# discovery endpoints let clients choose among enabled providers and query
+# the endpoint's current model list instead of relying on a static list.
+
+@app.get("/v1/llm/providers")
+def llm_providers():
+    try:
+        return llm_cleanup.available_providers()
+    except llm_cleanup.LLMError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/v1/llm/models")
+def llm_models(provider: str = "", refresh: bool = False):
+    try:
+        return llm_cleanup.list_models(provider or None, refresh=refresh)
+    except llm_cleanup.LLMConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except llm_cleanup.LLMUpstreamError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception:
+        log.exception("Could not list LLM models")
+        raise HTTPException(status_code=502, detail="could not list models")
+
+
 # --- Background jobs -------------------------------------------------------
 # Long recordings exceed proxy timeouts (e.g. Cloudflare's 100 s), so clients
 # can submit with background=true and poll for the result. One worker thread;
@@ -672,6 +592,23 @@ _job_queue: queue.Queue = queue.Queue()
 # iteration, so a dead thread (previously invisible) becomes detectable.
 _worker_heartbeat = time.time()
 _last_job_completed = time.time()
+
+
+@dataclass(frozen=True)
+class JobSpec:
+    """Everything one background transcription needs."""
+    job_id: str
+    audio_path: str
+    model: str
+    language: str | None
+    punctuation: bool
+    max_new_tokens: int
+    cleanup: bool
+    translate_to: str | None
+    llm_provider: str
+    llm_model: str
+    speak_voice: str
+    speak_speed: float
 
 
 def _set_job(job_id: str, **fields):
@@ -724,7 +661,7 @@ def _maybe_speak(result: dict, speak_voice: str, speak_speed: float):
         result["tts"] = {"error": str(exc)}
 
 
-def _run_job(item: tuple):
+def _run_job(item: JobSpec):
     """Process one queued job.
 
     The GPU lock covers only load -> generate -> unload; LLM cleanup and TTS
@@ -732,51 +669,58 @@ def _run_job(item: tuple):
     minutes at a time.
     """
     global _last_job_completed
-    (job_id, audio_path, model, language, punctuation, max_new_tokens,
-     cleanup, translate_to, speak_voice, speak_speed) = item
-    _set_job(job_id, status="running")
+    _set_job(item.job_id, status="running")
     result = None
     try:
         with _model_lock:
             try:
-                result = _transcribe(audio_path, model, language, punctuation,
-                                     max_new_tokens)
+                result = _transcribe(item.audio_path, item.model, item.language,
+                                     item.punctuation, item.max_new_tokens)
             except HTTPException as exc:
-                _set_job(job_id, status="failed", error=exc.detail)
+                _set_job(item.job_id, status="failed", error=exc.detail)
                 result = None
             except torch.OutOfMemoryError:
                 # Observed failure mode on the 4 GB card: free VRAM and retry
                 # with the smallest mini-batch before giving up.
                 _free_vram()
                 try:
-                    result = _transcribe(audio_path, model, language, punctuation,
-                                         max_new_tokens, chunk_batch=1)
+                    result = _transcribe(item.audio_path, item.model, item.language,
+                                         item.punctuation, item.max_new_tokens,
+                                         chunk_batch=1)
                 except torch.OutOfMemoryError:
-                    log.exception("Job %s failed (CUDA OOM)", job_id)
-                    _set_job(job_id, status="failed",
+                    log.exception("Job %s failed (CUDA OOM)", item.job_id)
+                    _set_job(item.job_id, status="failed",
                              error="GPU memory exhausted; retry with a shorter "
                                    "file or a lower ASR_CHUNK_BATCH")
                     result = None
             except Exception as exc:
                 err_id = uuid.uuid4().hex[:12]
-                log.exception("Job %s failed (%s)", job_id, err_id)
-                _set_job(job_id, status="failed", error=f"internal error (id {err_id})")
+                log.exception("Job %s failed (%s)", item.job_id, err_id)
+                _set_job(item.job_id, status="failed", error=f"internal error (id {err_id})")
                 result = None
             # Except-block names are cleared before this runs, so no live
             # traceback pins the model in memory here.
             unload_models()
 
         if result is not None:
-            if cleanup:
-                # ASR model is out of VRAM now; gemma gets the GPU to itself.
-                result["cleanup"] = run_cleanup(result["text"], translate_to)
-            _maybe_speak(result, speak_voice, speak_speed)
-            _set_job(job_id, status="done", result=result)
+            if item.cleanup:
+                # ASR model is out of VRAM now; the cleanup model gets the GPU.
+                try:
+                    llm = llm_cleanup.resolve_config(item.llm_provider or None,
+                                                     item.llm_model or None)
+                except Exception as exc:
+                    log.warning("LLM cleanup configuration failed: %s", exc)
+                    result["cleanup"] = {"error": str(exc)}
+                else:
+                    result["cleanup"] = run_cleanup(result["text"],
+                                                    item.translate_to, llm)
+            _maybe_speak(result, item.speak_voice, item.speak_speed)
+            _set_job(item.job_id, status="done", result=result)
     finally:
         try:
-            os.unlink(audio_path)
+            os.unlink(item.audio_path)
         except OSError:
-            log.warning("Could not unlink %s", audio_path)
+            log.warning("Could not unlink %s", item.audio_path)
         _last_job_completed = time.time()
 
 
@@ -794,9 +738,10 @@ def _job_worker():
         try:
             _run_job(item)
         except Exception:
-            log.exception("Job %s failed unexpectedly", item[0] if item else "?")
+            job_id = getattr(item, "job_id", "?")
+            log.exception("Job %s failed unexpectedly", job_id)
             try:
-                _set_job(item[0], status="failed", error="internal error")
+                _set_job(job_id, status="failed", error="internal error")
             except Exception:
                 pass
         finally:
@@ -834,6 +779,8 @@ def transcribe(
     cleanup: bool = Form(False),
     translate_lang: str = Form(""),
     translate_modifier: str = Form(""),
+    llm_provider: str = Form(""),
+    llm_model: str = Form(""),
     speak_voice: str = Form(""),
     speak_speed: float = Form(1.0),
 ):
@@ -852,8 +799,22 @@ def transcribe(
     if speak_voice and speak_voice not in _known_voice_ids():
         raise HTTPException(status_code=400,
                             detail=f"Unknown voice '{speak_voice}'. See /v1/tts/voices.")
-    audio_path = _save_upload(file)
     translate_to = _translate_target(translate_lang, translate_modifier) if cleanup else None
+    # Resolve provider/model before accepting the upload so a bad selection
+    # fails fast instead of after minutes of ASR work. A transient upstream
+    # failure (e.g. Ollama is down while its model list is being discovered)
+    # is deferred: cleanup retries after ASR and reports cleanup.error rather
+    # than failing the transcription.
+    llm_cfg = None
+    if cleanup:
+        try:
+            llm_cfg = llm_cleanup.resolve_config(llm_provider or None,
+                                                 llm_model or None)
+        except llm_cleanup.LLMConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except llm_cleanup.LLMUpstreamError as exc:
+            log.warning("Could not resolve LLM cleanup config yet: %s", exc)
+    audio_path = _save_upload(file)
 
     if background:
         # Return immediately; the client polls /v1/audio/transcriptions/jobs/<id>.
@@ -866,8 +827,20 @@ def transcribe(
             )
         job_id = uuid.uuid4().hex
         _set_job(job_id, status="queued", model=model)
-        _job_queue.put((job_id, audio_path, model, language, punctuation, max_new_tokens,
-                        cleanup, translate_to, speak_voice, speak_speed))
+        _job_queue.put(JobSpec(
+            job_id=job_id,
+            audio_path=audio_path,
+            model=model,
+            language=language,
+            punctuation=punctuation,
+            max_new_tokens=max_new_tokens,
+            cleanup=cleanup,
+            translate_to=translate_to,
+            llm_provider=llm_cfg.provider if llm_cfg else llm_provider,
+            llm_model=llm_cfg.model if llm_cfg else llm_model,
+            speak_voice=speak_voice,
+            speak_speed=speak_speed,
+        ))
         return JSONResponse(status_code=202, content={"job_id": job_id, "status": "queued", "model": model})
 
     # The load -> generate -> unload lifecycle runs under one lock: two models
@@ -917,8 +890,18 @@ def transcribe(
 
     if status_code is None:
         if cleanup:
-            # ASR model is out of VRAM now; gemma gets the GPU to itself.
-            result["cleanup"] = run_cleanup(result["text"], translate_to)
+            # ASR model is out of VRAM now; the cleanup model gets the GPU.
+            # llm_cfg is None when the provider could not be queried during
+            # validation (e.g. Ollama was briefly down), so resolve again here
+            # and report a cleanup error instead of losing the transcript.
+            try:
+                cfg = llm_cfg or llm_cleanup.resolve_config(llm_provider or None,
+                                                            llm_model or None)
+            except Exception as exc:
+                log.warning("LLM cleanup configuration failed: %s", exc)
+                result["cleanup"] = {"error": str(exc)}
+            else:
+                result["cleanup"] = run_cleanup(result["text"], translate_to, cfg)
         _maybe_speak(result, speak_voice, speak_speed)
         return result
     raise HTTPException(status_code=status_code, detail=detail)

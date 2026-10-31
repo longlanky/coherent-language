@@ -123,6 +123,21 @@
     font-size: 0.92rem;
   }
   .translate-inputs input:disabled { opacity: 0.5; }
+  .llm-block { margin: 8px 0 0 24px; }
+  .llm-block label { margin: 10px 0 4px; font-size: 0.88rem; }
+  .llm-block select, .llm-block input[type="text"] {
+    width: 100%; padding: 9px 10px; border-radius: 8px; box-sizing: border-box;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    font-size: 0.95rem;
+  }
+  .llm-block select:disabled, .llm-block input:disabled { opacity: 0.5; }
+  #llm-refresh {
+    margin-left: 6px; padding: 1px 7px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    font-size: 0.85rem;
+  }
+  #llm-refresh:hover { border-color: var(--accent); }
+  #llm-endpoint { margin-top: 6px; font-size: 0.78rem; color: var(--text-soft); word-break: break-all; }
   #cleaned-card { display: none; margin-top: 20px; }
   .badge {
     display: inline-block; padding: 2px 9px; border-radius: 10px;
@@ -198,7 +213,20 @@
     <select id="lang-select"></select>
 
     <label class="cleanup-row"><input type="checkbox" id="cleanup">
-      Clean up transcript with LLM (gemma4:e2b — punctuation, formatting, artifact removal; slower)</label>
+      Clean up transcript with an LLM (punctuation, formatting, artifact removal; slower)</label>
+
+    <div id="llm-block" class="llm-block" hidden>
+      <label for="llm-provider">Cleanup provider</label>
+      <select id="llm-provider"></select>
+      <label for="llm-model">Cleanup model
+        <button type="button" id="llm-refresh" title="Refresh model list">↻</button>
+      </label>
+      <select id="llm-model"></select>
+      <input type="text" id="llm-model-manual" maxlength="200" hidden
+             aria-label="Cleanup model id" autocomplete="off"
+             placeholder="model id (endpoint has no model list)">
+      <div id="llm-endpoint" class="meta"></div>
+    </div>
 
     <div id="translate-block">
       <label class="cleanup-row"><input type="checkbox" id="translate" disabled>
@@ -351,17 +379,114 @@ for (const l of TRANSLATE_LANGS) {
   opt.value = l;
   langList.appendChild(opt);
 }
-cleanupChk.onchange = () => {
-  translateChk.disabled = !cleanupChk.checked;
-  if (!cleanupChk.checked) {
+const llmBlock = $("llm-block"), llmProvider = $("llm-provider"),
+      llmModel = $("llm-model"), llmModelManual = $("llm-model-manual"),
+      llmRefresh = $("llm-refresh"), llmEndpoint = $("llm-endpoint");
+let llmProviders = [];
+
+function selectedLlmProvider() {
+  return llmProviders.find((p) => p.id === llmProvider.value) || null;
+}
+
+async function loadLlmProviders() {
+  try {
+    const resp = await fetch("/v1/llm/providers");
+    if (!resp.ok) throw new Error((await resp.text()).slice(0, 300));
+    const data = await resp.json();
+    llmProviders = data.providers || [];
+    llmProvider.innerHTML = "";
+    for (const p of llmProviders) {
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      opt.disabled = !p.configured;
+      opt.textContent = p.label
+        + (p.id === data.default_provider ? " (default)" : "")
+        + (p.configured ? "" : " — not configured");
+      llmProvider.appendChild(opt);
+    }
+    const configured = llmProviders.filter((p) => p.configured);
+    if (!configured.length) {
+      cleanupChk.disabled = true;
+      cleanupChk.checked = false;
+      llmBlock.hidden = true;
+      translateChk.disabled = translateLang.disabled = translateModifier.disabled = true;
+      showStatus("No LLM cleanup provider is configured on the server. Set "
+        + "DEEPSEEK_API_KEY, ANTHROPIC_API_KEY, OPENAI_BASE_URL, or configure Ollama.", true);
+      return;
+    }
+    const def = configured.find((p) => p.id === data.default_provider) || configured[0];
+    llmProvider.value = def.id;
+    if (cleanupChk.checked) await loadLlmModels();
+  } catch (err) {
+    cleanupChk.disabled = true;
+    showStatus("Could not read LLM providers: " + err.message, true);
+  }
+}
+
+async function loadLlmModels(refresh = false) {
+  if (!llmProvider.value) return;
+  const provider = llmProvider.value;
+  llmModel.innerHTML = "";
+  llmModelManual.hidden = true;
+  const loading = document.createElement("option");
+  loading.textContent = "loading models…";
+  loading.disabled = true;
+  llmModel.appendChild(loading);
+  try {
+    const url = `/v1/llm/models?provider=${encodeURIComponent(provider)}`
+      + (refresh ? "&refresh=true" : "");
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error((await resp.text()).slice(0, 300));
+    const data = await resp.json();
+    const models = data.models || [];
+    llmModel.innerHTML = "";
+    for (const m of models) {
+      const opt = document.createElement("option");
+      opt.value = m.id;
+      opt.textContent = m.label && m.label !== m.id ? `${m.id} — ${m.label}` : m.id;
+      llmModel.appendChild(opt);
+    }
+    const p = selectedLlmProvider();
+    const preferred = p && p.default_model;
+    if (preferred && models.some((m) => m.id === preferred)) llmModel.value = preferred;
+    llmEndpoint.textContent = (data.base_url ? "endpoint: " + data.base_url : "")
+      + (data.cached ? " (cached)" : "");
+    if (!models.length) throw new Error("endpoint returned no models");
+    hideStatus();
+  } catch (err) {
+    // Some compatible endpoints do not implement /models; allow a manual id.
+    llmModel.innerHTML = "";
+    llmModelManual.hidden = false;
+    const p = selectedLlmProvider();
+    llmModelManual.value = (p && p.default_model) || "";
+    llmEndpoint.textContent = p && p.base_url ? "endpoint: " + p.base_url : "";
+    showStatus("Could not list cleanup models: " + err.message, true);
+    if (llmModelManual.value) llmModelManual.focus();
+  }
+}
+
+cleanupChk.onchange = async () => {
+  const on = cleanupChk.checked;
+  llmBlock.hidden = !on;
+  translateChk.disabled = !on;
+  if (!on) {
     translateChk.checked = false;
     translateLang.disabled = translateModifier.disabled = true;
+  } else if (!llmModel.options.length) {
+    await loadLlmModels();
   }
+};
+llmProvider.onchange = () => loadLlmModels();
+llmRefresh.onclick = (event) => {
+  event.preventDefault();
+  loadLlmModels(true);
 };
 translateChk.onchange = () => {
   translateLang.disabled = translateModifier.disabled = !translateChk.checked;
   if (translateChk.checked) translateLang.focus();
 };
+
+loadLlmProviders();
 
 // --- audio selection ---
 function setAudio(blob, name) {
@@ -436,9 +561,14 @@ function renderCleanup(cleanup, lang, durationS) {
   cleanedText.textContent = cleanup.cleaned_text || "";
   cleanedText.dir = lang === "ar" ? "rtl" : "auto";
   const nChanges = (cleanup.changes || []).length;
+  const llm = cleanup.llm || {};
+  const llmLabel = llm.provider
+    ? ` · ${llm.provider}${llm.model ? "/" + llm.model : ""}`
+    : "";
   cleanedMeta.textContent = `${nChanges} change${nChanges === 1 ? "" : "s"} applied` +
     (cleanup.warnings && cleanup.warnings.length ? ` · ${cleanup.warnings.length} warning(s)` : "") +
-    (cleanup.translation ? ` · translated to ${cleanup.translation.target}` : "");
+    (cleanup.translation ? ` · translated to ${cleanup.translation.target}` : "") +
+    llmLabel;
 
   copyBtn.onclick = async () => {
     await navigator.clipboard.writeText(cleanup.cleaned_text || "");
@@ -572,6 +702,11 @@ submitBtn.onclick = async () => {
   form.append("max_new_tokens", $("max-new-tokens").value);
   form.append("background", "true");
   form.append("cleanup", cleanupChk.checked);
+  if (cleanupChk.checked) {
+    if (llmProvider.value) form.append("llm_provider", llmProvider.value);
+    const model = llmModelManual.hidden ? llmModel.value : llmModelManual.value.trim();
+    if (model) form.append("llm_model", model);
+  }
   if (translateChk.checked) {
     form.append("translate_lang", translateLang.value.trim());
     form.append("translate_modifier", translateModifier.value.trim());

@@ -169,9 +169,12 @@ def test_worker_survives_job_exception():
         worker = threading.Thread(target=app._job_worker, daemon=True, name="test-worker")
         worker.start()
         app._set_job("explodes", status="queued")
-        app._job_queue.put(("explodes", "/tmp/does-not-exist.wav",
-                            app._default_model, None, True, 256,
-                            False, None, "", 1.0))
+        app._job_queue.put(app.JobSpec(
+            job_id="explodes", audio_path="/tmp/does-not-exist.wav",
+            model=app._default_model, language=None, punctuation=True,
+            max_new_tokens=256, cleanup=False, translate_to=None,
+            llm_provider="", llm_model="", speak_voice="", speak_speed=1.0,
+        ))
         deadline = time.time() + 5
         while time.time() < deadline and app._jobs["explodes"].get("status") == "queued":
             time.sleep(0.05)
@@ -180,6 +183,87 @@ def test_worker_survives_job_exception():
     finally:
         app._run_job, app._job_queue = real_run, real_queue
         app._jobs.clear()
+
+
+# --- LLM provider discovery ------------------------------------------------
+
+def test_llm_providers_endpoint(monkeypatch):
+    monkeypatch.setattr(
+        app.llm_cleanup, "available_providers",
+        lambda: {"providers": [{"id": "deepseek", "configured": True}],
+                 "default_provider": "deepseek"},
+    )
+    body = TestClient(app.app).get("/v1/llm/providers").json()
+    assert body["providers"][0]["id"] == "deepseek"
+    assert body["default_provider"] == "deepseek"
+
+
+def test_llm_models_endpoint_queries_provider(monkeypatch):
+    seen = {}
+
+    def fake_list_models(provider=None, refresh=False):
+        seen.update(provider=provider, refresh=refresh)
+        return {"provider": provider, "base_url": "https://api.deepseek.com",
+                "models": [{"id": "deepseek-flash", "label": "DeepSeek-V4.1-Flash"}],
+                "cached": False}
+
+    monkeypatch.setattr(app.llm_cleanup, "list_models", fake_list_models)
+    body = TestClient(app.app).get("/v1/llm/models?provider=deepseek&refresh=true").json()
+    assert seen == {"provider": "deepseek", "refresh": True}
+    assert body["models"][0]["id"] == "deepseek-flash"
+
+
+def test_llm_models_endpoint_maps_upstream_error_to_502(monkeypatch):
+    def boom(provider=None, refresh=False):
+        raise app.llm_cleanup.LLMUpstreamError("provider is down", 503)
+
+    monkeypatch.setattr(app.llm_cleanup, "list_models", boom)
+    resp = TestClient(app.app).get("/v1/llm/models?provider=deepseek")
+    assert resp.status_code == 502
+    assert "provider is down" in resp.json()["detail"]
+
+
+def test_cleanup_upstream_failure_keeps_transcript(monkeypatch, tmp_path):
+    """A provider that cannot be reached must not discard the transcript."""
+    audio = tmp_path / "clip.wav"
+    audio.write_bytes(b"RIFF" + b"\0" * 32)
+    monkeypatch.setattr(app, "_save_upload", lambda _file: str(audio))
+    monkeypatch.setattr(
+        app, "_transcribe",
+        lambda *a, **kw: {"text": "hello", "model": "m",
+                           "language": "en", "duration_s": 1},
+    )
+    monkeypatch.setattr(app, "unload_models", lambda: None)
+
+    def down(*args, **kwargs):
+        raise app.llm_cleanup.LLMUpstreamError("ollama is down")
+
+    monkeypatch.setattr(app.llm_cleanup, "resolve_config", down)
+    resp = TestClient(app.app).post(
+        "/v1/audio/transcriptions",
+        files={"file": ("clip.wav", audio.read_bytes(), "audio/wav")},
+        data={"cleanup": "true", "llm_provider": "ollama"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["text"] == "hello"
+    assert "ollama is down" in body["cleanup"]["error"]
+
+
+def test_cleanup_rejects_disabled_provider(monkeypatch, tmp_path):
+    monkeypatch.setenv("LLM_PROVIDERS", "ollama")
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    audio = tmp_path / "clip.wav"
+    audio.write_bytes(b"RIFF" + b"\0" * 32)
+    resp = TestClient(app.app).post(
+        "/v1/audio/transcriptions",
+        files={"file": ("clip.wav", audio.read_bytes(), "audio/wav")},
+        data={"cleanup": "true", "llm_provider": "deepseek",
+              "llm_model": "deepseek-flash"},
+    )
+    assert resp.status_code == 400
+    assert "not enabled" in resp.json()["detail"]
 
 
 # --- health reporting ------------------------------------------------------

@@ -17,6 +17,7 @@ voices/
 api.key
 cf.jwt
 .api.key.swp
+.env
 
 # Local session helpers
 CONTINUE.sh
