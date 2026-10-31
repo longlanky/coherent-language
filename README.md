@@ -41,6 +41,7 @@ Long-form audio (>35 s) is chunked and reassembled automatically.
 | `language` | string | `en` (base) / `ar` (Arabic model) | Language code; validated against the model's supported languages |
 | `punctuation` | bool | `true` | `false` gives lower-cased output without punctuation |
 | `max_new_tokens` | int | `256` | Generation cap |
+| `timestamps` | bool | `false` | `true` → include `segments[]` with start/end times (see *Timestamps*) |
 | `background` | bool | `false` | `true` → return `202` + `job_id` immediately instead of waiting |
 | `cleanup` | bool | `false` | `true` → LLM post-process the transcript (see *LLM post-cleanup*) |
 | `llm_provider` | string | server default | with `cleanup=true`: `ollama`, `deepseek`, `anthropic`, or `openai` |
@@ -65,6 +66,24 @@ Backend notes: `punctuation` and `max_new_tokens` only apply to the Cohere
 models — the faster-whisper backend (`ivrit-whisper-large-v3-turbo-ct2`)
 ignores them (Whisper always punctuates, and long-audio windowing is handled
 internally instead of the `ASR_CHUNK_BATCH` mini-batch loop).
+
+**Timestamps (optional).** Pass `timestamps=true` to add `segments` to the
+response (`text` itself is unchanged):
+
+```json
+"segments": [
+  {"start": 0.0, "end": 31.42, "text": "First segment…"},
+  {"start": 31.42, "end": 66.08, "text": "Second segment…"}
+]
+```
+
+Cohere's model card documents no native timestamp support, so boundaries come
+from the same energy-based ~35 s chunks the processor already uses: they align
+with the decoded text, but one segment can span up to ~35 s. The Whisper backend
+returns its native, usually shorter, segments. Timestamps describe the raw ASR
+output; LLM cleanup/translation results stay plain text because rewritten text
+cannot be reliably re-aligned. The web UI has a **timestamps** checkbox under
+*Advanced settings*, and the CLI uses `--timestamps`.
 
 **Long recordings and proxy timeouts (Cloudflare's 100 s):** synchronous
 requests only work for audio short enough to finish within the proxy limit.
@@ -290,6 +309,7 @@ path is given and available, otherwise a terminal prompt.
 ./transcribe sermon.mp3 --language ar    # saves sermon.cohere-transcribe-arabic-07-2026-int8enc.txt
 ./transcribe sermon.mp3 --output out.txt --no-punctuation
 ./transcribe sermon.mp3 --server http://127.0.0.1:8000   # local server, no auth
+./transcribe sermon.mp3 --timestamps                    # [HH:MM:SS] segment prefixes
 ./transcribe sermon.mp3 --cleanup --llm-provider deepseek --llm-model deepseek-flash
 ./transcribe --list-llm-models deepseek                 # query the server's model list
 ```
@@ -305,6 +325,9 @@ path is given and available, otherwise a terminal prompt.
   Ctrl+C aborts the client without killing the server-side job.
 - The transcript is printed and saved next to the audio as
   `<name>.<model-id>.txt` unless `--output` is given.
+- `--timestamps` prints and saves one `[HH:MM:SS] text` line per ASR segment.
+  This applies to the raw transcript; LLM-cleaned output is saved separately
+  as plain text.
 
 ## Running
 
@@ -436,6 +459,9 @@ python3 -m venv .venv
   *" ففي الحالة دي المسألة دي يعني more safe"*
   (identical for FP16 and `-int8enc`)
 - Error paths: unknown model → 400 with available ids; non-audio file → 400.
+- **Timestamps**: a real 2.5 s clip returned one `segments` entry
+  (`0.00 → 2.48 s`), and chunk-offset derivation was checked against the real
+  processor on 40 s of audio (two contiguous chunks).
 - **LLM cleanup providers**: DeepSeek's live `/models` returned
   `deepseek-flash` and `deepseek-v4-pro`; cleanup and translation both produced
   valid JSON. Ollama and Anthropic request/response shapes are covered by the

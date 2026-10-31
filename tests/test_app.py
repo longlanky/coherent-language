@@ -10,6 +10,7 @@ import os
 import queue
 import threading
 import time
+import types
 
 import pytest
 
@@ -121,6 +122,181 @@ def test_maybe_speak_allows_known_voice(monkeypatch):
     assert result["tts"]["audio_wav_b64"]
 
 
+# --- timestamps ------------------------------------------------------------
+
+class _FakeChunkFeatureExtractor:
+    def __init__(self, sizes):
+        self.sizes = sizes
+
+    def _split_audio_chunks_energy(self, waveform):
+        chunks, position = [], 0
+        for size in self.sizes:
+            chunks.append(waveform[position:position + size])
+            position += size
+        return chunks
+
+
+class _FakeInputs(dict):
+    def to(self, *args, **kwargs):
+        return self
+
+
+def test_cohere_chunk_offsets_are_cumulative_samples():
+    audio = [0.0] * 32000
+    extractor = _FakeChunkFeatureExtractor([16000, 16000])
+    assert app._cohere_chunk_offsets(extractor, audio, len(audio)) == [
+        (0.0, 1.0), (1.0, 2.0),
+    ]
+
+
+def test_cohere_chunk_offsets_reject_incomplete_coverage():
+    extractor = _FakeChunkFeatureExtractor([100])
+    with pytest.raises(ValueError):
+        app._cohere_chunk_offsets(extractor, [0.0] * 200, 200)
+
+
+def test_segments_pair_text_with_offsets_and_drop_empty():
+    segments = app._segments_from_chunks(
+        ["  a  ", "", "b"],
+        [(0, 1.234), (1.234, 2.0), (2.0, 3.456)],
+        "fallback", 3.5,
+    )
+    assert segments == [
+        {"start": 0.0, "end": 1.23, "text": "a"},
+        {"start": 2.0, "end": 3.46, "text": "b"},
+    ]
+
+
+def test_segments_fall_back_when_alignment_is_impossible():
+    assert app._segments_from_chunks(["a", "b"], [(0, 1.0)], "whole text", 1.0) == [
+        {"start": 0.0, "end": 1.0, "text": "whole text"},
+    ]
+
+
+def test_cohere_transcription_uses_chunk_timestamps(monkeypatch):
+    class Tokenizer:
+        def decode(self, outputs, **kwargs):
+            return ["First.", "Second."]
+
+    class Processor:
+        tokenizer = Tokenizer()
+        feature_extractor = _FakeChunkFeatureExtractor([16000, 16000])
+
+        def __call__(self, audio, **kwargs):
+            return _FakeInputs(
+                input_features=app.torch.zeros((2, 8)),
+                audio_chunk_index=[(0, 0), (0, 1)],
+            )
+
+        def decode(self, outputs, **kwargs):
+            return "First. Second."
+
+    class Model:
+        device = "cpu"
+        dtype = app.torch.float32
+        config = types.SimpleNamespace(supported_languages=["en"])
+        generation_config = types.SimpleNamespace(pad_token_id=0, eos_token_id=0)
+
+        def generate(self, **kwargs):
+            return app.torch.zeros((2, 4), dtype=app.torch.long)
+
+    monkeypatch.setattr(app, "get_model", lambda name: (Processor(), Model()))
+    monkeypatch.setattr(app, "load_audio", lambda *a, **kw: [0.0] * 32000)
+
+    result = app._transcribe(
+        "unused.wav", "cohere-transcribe-03-2026", "en", True, 256,
+        timestamps=True,
+    )
+    assert result["text"] == "First. Second."
+    assert result["segments"] == [
+        {"start": 0.0, "end": 1.0, "text": "First."},
+        {"start": 1.0, "end": 2.0, "text": "Second."},
+    ]
+
+    plain = app._transcribe(
+        "unused.wav", "cohere-transcribe-03-2026", "en", True, 256,
+    )
+    assert "segments" not in plain
+
+
+def test_whisper_transcription_uses_native_segments(monkeypatch):
+    native = [
+        types.SimpleNamespace(start=0.0, end=2.5, text=" Hello "),
+        types.SimpleNamespace(start=2.5, end=4.0, text="world"),
+    ]
+    info = types.SimpleNamespace(duration=4.0)
+
+    class Model:
+        def transcribe(self, *args, **kwargs):
+            return iter(native), info
+
+    monkeypatch.setattr(app, "get_model", lambda name: (None, Model()))
+    result = app._transcribe(
+        "unused.wav", "ivrit-whisper-large-v3-turbo-ct2", "he", True, 256,
+        timestamps=True,
+    )
+    assert result["text"] == "Hello world"
+    assert result["segments"] == [
+        {"start": 0.0, "end": 2.5, "text": "Hello"},
+        {"start": 2.5, "end": 4.0, "text": "world"},
+    ]
+
+
+def test_transcription_forwards_timestamps_form_field(monkeypatch, tmp_path):
+    audio = tmp_path / "clip.wav"
+    audio.write_bytes(b"RIFF" + b"\0" * 32)
+    monkeypatch.setattr(app, "_save_upload", lambda _file: str(audio))
+    monkeypatch.setattr(app, "unload_models", lambda: None)
+    seen = {}
+
+    def fake_transcribe(*args, **kwargs):
+        seen.update(kwargs)
+        return {
+            "text": "hello", "model": "m", "language": "en", "duration_s": 1.0,
+            "segments": [{"start": 0.0, "end": 1.0, "text": "hello"}],
+        }
+
+    monkeypatch.setattr(app, "_transcribe", fake_transcribe)
+    resp = TestClient(app.app).post(
+        "/v1/audio/transcriptions",
+        files={"file": ("clip.wav", audio.read_bytes(), "audio/wav")},
+        data={"timestamps": "true"},
+    )
+    assert resp.status_code == 200
+    assert seen["timestamps"] is True
+    assert resp.json()["segments"] == [
+        {"start": 0.0, "end": 1.0, "text": "hello"},
+    ]
+
+
+def test_background_job_carries_timestamps(monkeypatch, tmp_path):
+    audio = tmp_path / "clip.wav"
+    audio.write_bytes(b"RIFF" + b"\0" * 32)
+    seen = {}
+
+    def fake_transcribe(*args, **kwargs):
+        seen.update(kwargs)
+        return {
+            "text": "hi", "model": "m", "language": "en", "duration_s": 1.0,
+            "segments": [{"start": 0.0, "end": 1.0, "text": "hi"}],
+        }
+
+    monkeypatch.setattr(app, "_transcribe", fake_transcribe)
+    monkeypatch.setattr(app, "unload_models", lambda: None)
+    app._jobs.clear()
+    app._run_job(app.JobSpec(
+        job_id="timed-job", audio_path=str(audio), model=app._default_model,
+        language="en", punctuation=True, max_new_tokens=256, timestamps=True,
+        cleanup=False, translate_to=None, llm_provider="", llm_model="",
+        speak_voice="", speak_speed=1.0,
+    ))
+    assert seen["timestamps"] is True
+    assert app._jobs["timed-job"]["result"]["segments"] == [
+        {"start": 0.0, "end": 1.0, "text": "hi"},
+    ]
+    app._jobs.clear()
+
+
 # --- job lifecycle: TTL expiry, DELETE, backpressure -----------------------
 
 def test_expire_jobs_drops_old_terminal_jobs():
@@ -172,8 +348,9 @@ def test_worker_survives_job_exception():
         app._job_queue.put(app.JobSpec(
             job_id="explodes", audio_path="/tmp/does-not-exist.wav",
             model=app._default_model, language=None, punctuation=True,
-            max_new_tokens=256, cleanup=False, translate_to=None,
-            llm_provider="", llm_model="", speak_voice="", speak_speed=1.0,
+            max_new_tokens=256, timestamps=False, cleanup=False,
+            translate_to=None, llm_provider="", llm_model="",
+            speak_voice="", speak_speed=1.0,
         ))
         deadline = time.time() + 5
         while time.time() < deadline and app._jobs["explodes"].get("status") == "queued":

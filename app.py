@@ -260,12 +260,69 @@ def list_models():
     }
 
 
+def _cohere_chunk_offsets(feature_extractor, audio, total_samples: int
+                          ) -> list[tuple[float, float]]:
+    """Return (start, end) seconds for the processor's audio chunks.
+
+    The Cohere feature extractor splits long audio into contiguous chunks at
+    quiet points near ``max_audio_clip_s``. It only returns the chunk tensors,
+    but they tile the input exactly, so cumulative sample counts recover the
+    offsets without a second ASR pass. This deliberately mirrors the exact
+    chunking that produced the model outputs.
+    """
+    waveform = torch.as_tensor(audio, dtype=torch.float32)
+    chunks = feature_extractor._split_audio_chunks_energy(waveform)
+    offsets: list[tuple[float, float]] = []
+    position = 0
+    for chunk in chunks:
+        size = int(chunk.shape[0])
+        if size <= 0:
+            continue
+        offsets.append((position / SAMPLE_RATE, (position + size) / SAMPLE_RATE))
+        position += size
+    if not offsets or position != total_samples:
+        raise ValueError("audio chunks did not cover the input exactly")
+    return offsets
+
+
+def _segments_from_chunks(chunk_texts: list[str],
+                          offsets: list[tuple[float, float]],
+                          fallback_text: str, duration_s: float) -> list[dict]:
+    """Pair per-chunk decoded text with chunk times.
+
+    Any misalignment falls back to one whole-file segment rather than emitting
+    incorrectly timed text.
+    """
+    if not offsets or len(chunk_texts) != len(offsets):
+        log.warning("Could not align %d chunk text(s) with %d offset(s); "
+                    "using one timestamp segment", len(chunk_texts), len(offsets))
+        return [{"start": 0.0, "end": round(duration_s, 2),
+                 "text": fallback_text}]
+
+    segments = []
+    for (start, end), chunk in zip(offsets, chunk_texts):
+        chunk = (chunk or "").strip()
+        if chunk:
+            segments.append({"start": round(start, 2), "end": round(end, 2),
+                             "text": chunk})
+    if not segments:
+        return [{"start": 0.0, "end": round(duration_s, 2),
+                 "text": fallback_text}]
+    return segments
+
+
 def _transcribe(audio_path: str, model: str, language: str | None,
                 punctuation: bool, max_new_tokens: int,
-                chunk_batch: int | None = None) -> dict:
+                chunk_batch: int | None = None,
+                timestamps: bool = False) -> dict:
     """Run one transcription on a local audio file. Holds all model/tensor
     references in this frame, so they are released when it returns — the
-    caller can then free the VRAM."""
+    caller can then free the VRAM.
+
+    When ``timestamps`` is true the result gains ``segments``: Whisper uses its
+    native segment times; Cohere uses the processor's energy-based chunk
+    boundaries (its model card documents no native timestamps).
+    """
     processor, asr_model = get_model(model)
 
     lang = language or MODELS[model]["default_language"]
@@ -275,17 +332,28 @@ def _transcribe(audio_path: str, model: str, language: str | None,
         # natively) and windows long files internally, so the load_audio
         # fallback and mini-batch loop below don't apply. `punctuation` and
         # `max_new_tokens` are Cohere-only and ignored here.
-        segments, info = asr_model.transcribe(audio_path, language=lang,
-                                              beam_size=5)
-        text = " ".join(s.text for s in segments).strip()
+        whisper_segments, info = asr_model.transcribe(audio_path, language=lang,
+                                                      beam_size=5)
+        whisper_segments = list(whisper_segments)
+        text = " ".join((s.text or "").strip() for s in whisper_segments).strip()
         log.info("Transcribed %.1fs of audio with %s (%s)",
                  info.duration, model, lang)
-        return {
+        result = {
             "text": text,
             "model": model,
             "language": lang,
             "duration_s": round(info.duration, 2),
         }
+        if timestamps:
+            segments = [
+                {"start": round(s.start, 2), "end": round(s.end, 2),
+                 "text": (s.text or "").strip()}
+                for s in whisper_segments if (s.text or "").strip()
+            ]
+            result["segments"] = segments or [
+                {"start": 0.0, "end": round(info.duration, 2), "text": text}
+            ]
+        return result
 
     languages = getattr(asr_model.config, "supported_languages", None) or []
     if languages and lang not in languages:
@@ -373,13 +441,29 @@ def _transcribe(audio_path: str, model: str, language: str | None,
     if isinstance(text, (list, tuple)):
         text = text[0] if text else ""
 
-    log.info("Transcribed %.1fs of audio with %s (%s)", duration_s, model, lang)
-    return {
+    result = {
         "text": text,
         "model": model,
         "language": lang,
         "duration_s": round(duration_s, 2),
     }
+    if timestamps:
+        try:
+            chunk_texts = processor.tokenizer.decode(
+                outputs, skip_special_tokens=True)
+            if isinstance(chunk_texts, str):
+                chunk_texts = [chunk_texts]
+            offsets = _cohere_chunk_offsets(
+                processor.feature_extractor, audio, len(audio))
+        except Exception:
+            log.warning("Could not derive Cohere chunk timestamps; "
+                        "using one segment", exc_info=True)
+            chunk_texts, offsets = [], []
+        result["segments"] = _segments_from_chunks(
+            chunk_texts, offsets, text, duration_s)
+
+    log.info("Transcribed %.1fs of audio with %s (%s)", duration_s, model, lang)
+    return result
 
 
 def _save_upload(file: UploadFile) -> str:
@@ -603,6 +687,7 @@ class JobSpec:
     language: str | None
     punctuation: bool
     max_new_tokens: int
+    timestamps: bool
     cleanup: bool
     translate_to: str | None
     llm_provider: str
@@ -675,7 +760,8 @@ def _run_job(item: JobSpec):
         with _model_lock:
             try:
                 result = _transcribe(item.audio_path, item.model, item.language,
-                                     item.punctuation, item.max_new_tokens)
+                                     item.punctuation, item.max_new_tokens,
+                                     timestamps=item.timestamps)
             except HTTPException as exc:
                 _set_job(item.job_id, status="failed", error=exc.detail)
                 result = None
@@ -686,7 +772,7 @@ def _run_job(item: JobSpec):
                 try:
                     result = _transcribe(item.audio_path, item.model, item.language,
                                          item.punctuation, item.max_new_tokens,
-                                         chunk_batch=1)
+                                         chunk_batch=1, timestamps=item.timestamps)
                 except torch.OutOfMemoryError:
                     log.exception("Job %s failed (CUDA OOM)", item.job_id)
                     _set_job(item.job_id, status="failed",
@@ -776,6 +862,7 @@ def transcribe(
     punctuation: bool = Form(True),
     max_new_tokens: int = Form(256),
     background: bool = Form(False),
+    timestamps: bool = Form(False),
     cleanup: bool = Form(False),
     translate_lang: str = Form(""),
     translate_modifier: str = Form(""),
@@ -834,6 +921,7 @@ def transcribe(
             language=language,
             punctuation=punctuation,
             max_new_tokens=max_new_tokens,
+            timestamps=timestamps,
             cleanup=cleanup,
             translate_to=translate_to,
             llm_provider=llm_cfg.provider if llm_cfg else llm_provider,
@@ -852,7 +940,8 @@ def transcribe(
         # exception is in flight its traceback keeps _transcribe's frame (and
         # thus the model) alive, which would defeat the VRAM release below.
         try:
-            result = _transcribe(audio_path, model, language, punctuation, max_new_tokens)
+            result = _transcribe(audio_path, model, language, punctuation,
+                                 max_new_tokens, timestamps=timestamps)
         except HTTPException as exc:
             status_code, detail = exc.status_code, exc.detail
         except torch.OutOfMemoryError:
@@ -861,7 +950,8 @@ def transcribe(
             _free_vram()
             try:
                 result = _transcribe(audio_path, model, language, punctuation,
-                                     max_new_tokens, chunk_batch=1)
+                                     max_new_tokens, chunk_batch=1,
+                                     timestamps=timestamps)
             except torch.OutOfMemoryError:
                 log.exception("Transcription failed (CUDA OOM)")
                 status_code, detail = (503, "GPU memory exhausted; retry with a "

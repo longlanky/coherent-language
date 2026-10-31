@@ -145,6 +145,44 @@ def test_cleanup_sends_llm_selection(cli, monkeypatch, tmp_path):
     assert b"deepseek-flash" in body
 
 
+def test_timestamps_are_requested_and_saved(cli, monkeypatch, tmp_path):
+    audio = tmp_path / "clip.wav"
+    audio.write_bytes(b"RIFF" + b"\0" * 32)
+    out = tmp_path / "out.txt"
+    seen = []
+
+    def fake_http_json(req):
+        seen.append(req)
+        if req.get_method() == "POST":
+            return {"job_id": "stub", "status": "queued"}
+        return {
+            "status": "done",
+            "result": {
+                "text": "hello later", "model": "m", "duration_s": 65,
+                "segments": [
+                    {"start": 0.0, "end": 5.0, "text": "hello"},
+                    {"start": 65.0, "end": 70.0, "text": "later"},
+                ],
+            },
+        }
+
+    monkeypatch.setattr(cli, "http_json", fake_http_json)
+    monkeypatch.setattr(cli, "get_cookie", lambda _args: None)
+    monkeypatch.setattr(cli, "MAX_WAIT_S", 30)
+    monkeypatch.setattr(cli, "POLL_EVERY", 0)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["transcribe", str(audio), "--server", "http://127.0.0.1:8000",
+         "--timestamps", "--output", str(out)],
+    )
+    assert cli.main() == 0
+
+    assert b'name="timestamps"\r\n\r\ntrue' in seen[0].data
+    saved = out.read_text()
+    assert "[00:00:00] hello" in saved
+    assert "[00:01:05] later" in saved
+
+
 def test_untrusted_remote_host_refuses_the_credential(cli, monkeypatch, tmp_path):
     audio = tmp_path / "clip.wav"
     audio.write_bytes(b"RIFF" + b"\0" * 32)

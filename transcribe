@@ -13,6 +13,7 @@ Usage:
   ./transcribe                                # GUI file picker (zenity) or prompt
   ./transcribe audio.mp3 --language ar --model cohere-transcribe-arabic-07-2026-int8enc
   ./transcribe audio.mp3 --server http://127.0.0.1:8000 --output out.txt
+  ./transcribe audio.mp3 --timestamps          # [HH:MM:SS] segment prefixes
   ./transcribe audio.mp3 --cleanup --llm-provider deepseek --llm-model deepseek-flash
   ./transcribe --list-llm-models deepseek     # query the server's model list
 
@@ -50,6 +51,20 @@ def server_host(server: str) -> str:
     """Hostname of a server URL (exact match, not a substring test —
     'localhost.evil.example' must not count as local)."""
     return (urllib.parse.urlparse(server).hostname or "").lower()
+
+
+def format_clock(seconds) -> str:
+    total = max(0, int(float(seconds or 0)))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def format_timestamped(segments) -> str:
+    return "\n".join(
+        f"[{format_clock(seg.get('start'))}] {seg.get('text', '')}"
+        for seg in segments
+    )
 
 
 def pick_file() -> Path:
@@ -115,6 +130,8 @@ def main() -> int:
     p.add_argument("--model", default=os.environ.get("ASR_MODEL"), help="Model id (default: server's)")
     p.add_argument("--language", default=os.environ.get("ASR_LANGUAGE"), help="e.g. ar, en")
     p.add_argument("--no-punctuation", action="store_true")
+    p.add_argument("--timestamps", action="store_true",
+                   help="Prefix each transcript segment with its start time")
     p.add_argument("--cleanup", action="store_true",
                    help="Post-process with the server's LLM; also saves <name>.cleaned.txt")
     p.add_argument("--translate", metavar="LANG",
@@ -169,6 +186,7 @@ def main() -> int:
         sys.exit(f"File not found: {audio}")
 
     fields = {"background": "true", "punctuation": str(not args.no_punctuation).lower(),
+              "timestamps": str(bool(args.timestamps)).lower(),
               "cleanup": str(bool(args.cleanup or args.translate)).lower()}
     if args.translate:
         fields["translate_lang"] = args.translate
@@ -216,6 +234,8 @@ def main() -> int:
 
     result = job["result"]
     text = result["text"]
+    if args.timestamps and result.get("segments"):
+        text = format_timestamped(result["segments"])
     used_model = result.get("model", model)
     out = Path(args.output) if args.output else audio.with_suffix(f".{used_model}.txt")
     out.write_text(text + "\n")
