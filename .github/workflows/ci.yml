@@ -24,7 +24,10 @@ jobs:
           .venv/bin/pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
 
       - name: Install dependencies
-        run: .venv/bin/pip install -r requirements.txt
+        # requirements.txt also carries the TTS/SILMA stack, which is imported
+        # lazily and is not needed by these tests (and is not installable from
+        # PyPI on CI's Python 3.14).
+        run: .venv/bin/pip install -r requirements-ci.txt
 
       - name: Syntax check the CLI client
         run: .venv/bin/python -m py_compile app.py quant.py tts.py && .venv/bin/python -c "import ast;ast.parse(open('transcribe').read())"
